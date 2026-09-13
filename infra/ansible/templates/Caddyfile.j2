@@ -4,7 +4,9 @@
         X-Content-Type-Options nosniff
         Referrer-Policy no-referrer
     }
-    request_body { max_size 32KB }
+    request_body {
+        max_size 32KB
+    }
     handle /source.tar.gz {
         root * /srv
         file_server

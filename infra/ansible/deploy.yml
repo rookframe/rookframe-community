@@ -72,6 +72,11 @@
         src: ../../dist/source.tar.gz
         dest: "{{ source_root }}/dist-public/source.tar.gz"
         mode: '0644'
+    - name: Validate the HTTPS proxy configuration
+      ansible.builtin.command:
+        cmd: docker compose -f compose.production.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+        chdir: "{{ deployment_root }}"
+      changed_when: false
     - name: Start the selected release
       ansible.builtin.command:
         cmd: docker compose -f compose.production.yml up -d --wait --wait-timeout 180
