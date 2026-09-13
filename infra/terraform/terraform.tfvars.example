@@ -1,0 +1,4 @@
+# HCLOUD_TOKEN is supplied from your local secret environment, never this file.
+location = "nbg1"
+server_type = "cx23"
+admin_cidrs = ["203.0.113.10/32"] # Replace with your current administration address.

@@ -1,0 +1,3 @@
+domain: community.example.com
+# Generate with: openssl rand -hex 32
+database_password: REPLACE_WITH_64_RANDOM_HEX_CHARACTERS

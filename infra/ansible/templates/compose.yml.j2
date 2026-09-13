@@ -1,0 +1,45 @@
+name: rookframe-community
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: community
+      POSTGRES_USER: community
+      POSTGRES_PASSWORD: {{ database_password | to_json }}
+    volumes:
+      - {{ data_path }}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U community"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app:
+    build: {{ source_root | to_json }}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    environment:
+      DATABASE_URL: {{ ('postgres://community:' + database_password + '@db/community') | to_json }}
+      LISTEN_ADDR: '0.0.0.0:8080'
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, /app/community, healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - {{ data_path }}/caddy:/data
+      - {{ source_root }}/dist-public:/srv:ro
+    depends_on:
+      app: {condition: service_healthy}

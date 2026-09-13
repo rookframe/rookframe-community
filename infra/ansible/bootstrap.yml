@@ -1,0 +1,37 @@
+---
+- name: Prepare the Community Server host
+  hosts: community
+  become: true
+  tasks:
+    - name: Wait for cloud initialization
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+    - name: Create the package signing key directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+    - name: Install Docker signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+    - name: Install repository metadata support
+      ansible.builtin.apt:
+        name: python3-debian
+        state: present
+        update_cache: true
+    - name: Configure Docker repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: [deb]
+        uris: https://download.docker.com/linux/ubuntu
+        suites: [noble]
+        components: [stable]
+        architectures: [amd64]
+        signed_by: /etc/apt/keyrings/docker.asc
+    - name: Install the container engine and compose plugin
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+        state: present
+        update_cache: true

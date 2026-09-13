@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+cd /opt/rookframe-community
+backup_file="{{ data_path }}/backups/community-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+docker compose -f compose.production.yml exec -T db pg_dump -U community --no-owner community | gzip > "$backup_file.pending"
+gzip -t "$backup_file.pending"
+mv "$backup_file.pending" "$backup_file"
+find '{{ data_path }}/backups' -type f -name 'community-*.sql.gz' -mtime +14 -delete

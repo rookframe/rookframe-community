@@ -1,0 +1,98 @@
+---
+- import_playbook: bootstrap.yml
+
+- name: Deploy the committed Community Server source
+  hosts: community
+  become: true
+  vars_files:
+    - ../.local/config.yml
+  vars:
+    deployment_root: /opt/rookframe-community
+    source_root: "{{ deployment_root }}/releases/{{ release_revision }}"
+  tasks:
+    - name: Require safe runtime configuration
+      ansible.builtin.assert:
+        that:
+          - database_password is match('^[0-9a-f]{64}$')
+          - domain is match('^[a-z0-9.-]+$')
+          - release_revision is match('^[0-9a-f]{40}$')
+      no_log: true
+    - name: Require the attached data volume to be mounted
+      ansible.builtin.command: "mountpoint -q {{ data_path }}"
+      changed_when: false
+    - name: Create deployment and backup directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: ["{{ deployment_root }}", "{{ source_root }}", "{{ data_path }}/backups"]
+    - name: Unpack the exact committed source archive
+      ansible.builtin.unarchive:
+        src: ../../dist/source.tar.gz
+        dest: "{{ source_root }}"
+    - name: Write production compose configuration
+      ansible.builtin.template:
+        src: compose.yml.j2
+        dest: "{{ deployment_root }}/compose.production.yml"
+        mode: '0600'
+      no_log: true
+    - name: Write HTTPS reverse proxy configuration
+      ansible.builtin.template:
+        src: Caddyfile.j2
+        dest: "{{ deployment_root }}/Caddyfile"
+        mode: '0644'
+    - name: Build the committed application
+      ansible.builtin.command:
+        cmd: docker compose -f compose.production.yml build app
+        chdir: "{{ deployment_root }}"
+      changed_when: true
+    - name: Start persistent PostgreSQL
+      ansible.builtin.command:
+        cmd: docker compose -f compose.production.yml up -d db --wait
+        chdir: "{{ deployment_root }}"
+      changed_when: true
+    - name: Back up before applying migrations
+      ansible.builtin.shell:
+        cmd: "set -o pipefail; docker compose -f compose.production.yml exec -T db pg_dump -U community community | gzip > {{ data_path }}/backups/pre-{{ release_revision }}.sql.gz"
+        chdir: "{{ deployment_root }}"
+        executable: /bin/bash
+      changed_when: true
+    - name: Apply explicit versioned migrations
+      ansible.builtin.command:
+        cmd: docker compose -f compose.production.yml run --rm app migrate
+        chdir: "{{ deployment_root }}"
+      changed_when: true
+    - name: Create corresponding source download directory
+      ansible.builtin.file:
+        path: "{{ source_root }}/dist-public"
+        state: directory
+        mode: '0755'
+    - name: Offer the exact corresponding source for this running release
+      ansible.builtin.copy:
+        src: ../../dist/source.tar.gz
+        dest: "{{ source_root }}/dist-public/source.tar.gz"
+        mode: '0644'
+    - name: Start the selected release
+      ansible.builtin.command:
+        cmd: docker compose -f compose.production.yml up -d --wait --wait-timeout 180
+        chdir: "{{ deployment_root }}"
+      changed_when: true
+    - name: Install database backup script
+      ansible.builtin.template:
+        src: backup.sh.j2
+        dest: /usr/local/sbin/community-backup
+        mode: '0700'
+    - name: Configure daily database dumps
+      ansible.builtin.copy:
+        dest: /etc/cron.d/community-backup
+        mode: '0644'
+        content: "17 2 * * * root /usr/local/sbin/community-backup\n"
+    - name: Verify the API through its public HTTPS endpoint
+      ansible.builtin.uri:
+        url: "https://{{ domain }}/api/v1/health"
+        return_content: true
+        status_code: 200
+      register: health
+      retries: 12
+      delay: 10
+      until: health.status == 200

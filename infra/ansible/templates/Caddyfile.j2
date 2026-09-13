@@ -1,0 +1,15 @@
+{{ domain }} {
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+    }
+    request_body { max_size 32KB }
+    handle /source.tar.gz {
+        root * /srv
+        file_server
+    }
+    handle {
+        reverse_proxy app:8080
+    }
+}
