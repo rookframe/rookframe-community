@@ -156,3 +156,24 @@ async fn invalid_publication_leaves_previous_listing_and_revision_unchanged(db: 
         StatusCode::CONFLICT
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn invalid_cover_links_never_poison_anonymous_directory_results(db: PgPool) {
+    let app = rookframe_community::router(db);
+    for cover in [
+        "https://",
+        "https://user:password@example.com/image.png",
+        "https://example.com/#fragment",
+    ] {
+        let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let mut data = listing();
+        data["cover_image"] = json!(cover);
+        let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":data});
+        assert_eq!(
+            request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (_, page) = request(&app, "GET", "/worlds", Value::Null, None).await;
+    assert!(page["listings"].as_array().unwrap().is_empty());
+}

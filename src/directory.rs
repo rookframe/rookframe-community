@@ -39,6 +39,10 @@ pub struct Search {
     limit: Option<i64>,
 }
 
+fn valid_id(id: Uuid) -> bool {
+    id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122
+}
+
 pub async fn publish(
     State(db): State<PgPool>,
     Path((world, address)): Path<(Uuid, Uuid)>,
@@ -51,10 +55,10 @@ pub async fn publish(
         .and_then(|v| v.strip_prefix("Bearer "))
         .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or(ApiError(StatusCode::UNAUTHORIZED, "administrator_required"))?;
-    if world.get_version_num() != 4
-        || address.get_version_num() != 4
+    if !valid_id(world)
+        || !valid_id(address)
         || world == address
-        || change.operation_id.get_version_num() != 4
+        || !valid_id(change.operation_id)
         || change.expected_revision < 0
         || change.expected_revision == i64::MAX
     {
@@ -131,7 +135,16 @@ impl Listing {
         if self
             .cover_image
             .as_ref()
-            .is_some_and(|s| !s.starts_with("https://") || s.len() < 9 || s.contains('@'))
+            .is_some_and(|s| match url::Url::parse(s) {
+                Ok(url) => {
+                    url.scheme() != "https"
+                        || url.host_str().is_none()
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                }
+                Err(_) => true,
+            })
         {
             return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_cover_image"));
         }
