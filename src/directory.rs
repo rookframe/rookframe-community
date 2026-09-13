@@ -29,7 +29,7 @@ pub struct Mutation {
     operation_id: Uuid,
     expected_revision: i64,
     listing: Option<Listing>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     capacity: Option<Capacity>,
 }
 #[derive(Deserialize)]

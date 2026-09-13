@@ -313,3 +313,19 @@ async fn capacity_is_full_then_removed_without_republishing_on_replay(db: PgPool
         StatusCode::OK
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn legacy_operation_replay_survives_capacity_upgrade(db: PgPool) {
+    let app = rookframe_community::router(db.clone());
+    let world = Uuid::new_v4();
+    let address = Uuid::new_v4();
+    let path = format!("/worlds/{world}/{address}");
+    let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":listing()});
+    let original = request(&app, "PUT", &path, change.clone(), Some(ADMIN)).await;
+    assert_eq!(original.0, StatusCode::OK);
+    // Pre-upgrade receipts have no capacity property at all.
+    sqlx::query("UPDATE directory_operations SET request=request-'capacity' WHERE world_id=$1 AND world_address=$2")
+        .bind(world).bind(address).execute(&db).await.unwrap();
+    let replay = request(&app, "PUT", &path, change, Some(ADMIN)).await;
+    assert_eq!(replay, original);
+}
