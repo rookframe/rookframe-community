@@ -22,6 +22,10 @@ pub fn router(db: PgPool) -> Router {
             "/api/v1/worlds/{world}/{address}",
             get(directory::read).put(directory::publish),
         )
+        .route(
+            "/api/v1/worlds/{world}/{address}/capacity",
+            axum::routing::put(directory::capacity),
+        )
         .with_state(db.clone())
         .merge(setup::router(db))
         .layer(DefaultBodyLimit::max(32 * 1024))
@@ -39,7 +43,7 @@ pub fn router(db: PgPool) -> Router {
 }
 
 async fn health(State(db): State<PgPool>) -> Result<Json<Value>, error::ApiError> {
-    sqlx::query("SELECT revision FROM world_addresses LIMIT 1")
+    sqlx::query("SELECT revision,admission_revision,reserved_seats,claimed_seats FROM world_addresses LIMIT 1")
         .execute(&db)
         .await?;
     Ok(Json(json!({"status":"ok","api_version":1})))

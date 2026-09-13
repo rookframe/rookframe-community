@@ -82,3 +82,11 @@ request bodies, authorization, SDP, candidates, proofs or private URLs.
 There is no TURN server in this deployment. The application currently uses
 Cloudflare's public STUN facility for direct-route discovery; no relay credentials
 are issued. The Community Server does not receive gameplay traffic.
+
+## Capacity migration
+
+Migration `0002_capacity.sql` adds bounded reservation/claim counts and an
+admission revision, defaulting existing addresses to zero. Deployment backs up
+PostgreSQL before applying it. The health probe references these columns, so an
+unmigrated deployment cannot report readiness. Automatic Private cleanup keeps
+address ownership and operation receipts. It never republishes a World.

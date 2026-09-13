@@ -29,6 +29,8 @@ pub struct Mutation {
     operation_id: Uuid,
     expected_revision: i64,
     listing: Option<Listing>,
+    #[serde(default)]
+    capacity: Option<Capacity>,
 }
 #[derive(Deserialize)]
 pub struct Search {
@@ -70,6 +72,15 @@ pub async fn publish(
     if let Some(listing) = &change.listing {
         listing.validate()?;
     }
+    let capacity = change.capacity.clone().unwrap_or_default();
+    capacity.validate()?;
+    if change
+        .listing
+        .as_ref()
+        .is_some_and(|l| capacity.reserved > l.player_limit || capacity.claimed >= l.player_limit)
+    {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_player_limit"));
+    }
     let digest = Sha256::digest(token.as_bytes()).to_vec();
     let payload = serde_json::to_value(&change).expect("serializable mutation");
     let mut tx = db.begin().await?;
@@ -77,7 +88,7 @@ pub async fn publish(
     // first commit establishes ownership; removal never gives that ownership away.
     sqlx::query("INSERT INTO world_addresses (world_id,world_address,administrator_digest) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
         .bind(world).bind(address).bind(&digest).execute(&mut *tx).await?;
-    let current = sqlx::query("SELECT administrator_digest,revision FROM world_addresses WHERE world_id=$1 AND world_address=$2 FOR UPDATE")
+    let current = sqlx::query("SELECT administrator_digest,revision,admission_revision,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 FOR UPDATE")
         .bind(world).bind(address).fetch_one(&mut *tx).await?;
     if current.get::<Vec<u8>, _>("administrator_digest") != digest {
         return Err(ApiError(StatusCode::FORBIDDEN, "administrator_mismatch"));
@@ -91,13 +102,14 @@ pub async fn publish(
     if revision != change.expected_revision {
         return Err(ApiError(StatusCode::CONFLICT, "revision_conflict"));
     }
+    require_capacity_revision(&current, &capacity)?;
     let listing = change
         .listing
         .as_ref()
         .map(|l| serde_json::to_value(l).expect("serializable listing"));
     let result = json!({"operation_id":change.operation_id,"revision":revision+1,"visibility":if listing.is_some(){"public"}else{"private"}});
-    sqlx::query("UPDATE world_addresses SET listing=$3,revision=revision+1,checked_in_at=now() WHERE world_id=$1 AND world_address=$2")
-        .bind(world).bind(address).bind(listing).execute(&mut *tx).await?;
+    sqlx::query("UPDATE world_addresses SET listing=$3,revision=revision+1,checked_in_at=now(),admission_revision=$4,reserved_seats=$5,claimed_seats=$6 WHERE world_id=$1 AND world_address=$2")
+        .bind(world).bind(address).bind(listing).bind(capacity.revision).bind(capacity.reserved).bind(capacity.claimed).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO directory_operations (world_id,world_address,operation_id,request,result) VALUES ($1,$2,$3,$4,$5)")
         .bind(world).bind(address).bind(change.operation_id).bind(payload).bind(&result).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -159,7 +171,7 @@ pub async fn read(
     State(db): State<PgPool>,
     Path((world, address)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
-    let row = sqlx::query("SELECT world_id,world_address,revision,listing FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days'")
+    let row = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days'")
         .bind(world).bind(address).fetch_optional(&db).await?.ok_or(ApiError(StatusCode::NOT_FOUND,"listing_not_found"))?;
     Ok(Json(entry(row)))
 }
@@ -182,7 +194,7 @@ pub async fn browse(
             .replace('%', "\\%")
             .replace('_', "\\_")
     );
-    let rows = sqlx::query("SELECT world_id,world_address,revision,listing FROM world_addresses WHERE listing IS NOT NULL AND checked_in_at > now()-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language') ILIKE $1 ORDER BY checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
+    let rows = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE listing IS NOT NULL AND checked_in_at > now()-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language') ILIKE $1 ORDER BY (reserved_seats >= (listing->>'player_limit')::int),checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
         .bind(pattern).bind(limit+1).bind(search.offset).fetch_all(&db).await?;
     let next = if rows.len() > limit as usize {
         Some(search.offset + limit)
@@ -194,5 +206,90 @@ pub async fn browse(
     ))
 }
 fn entry(row: sqlx::postgres::PgRow) -> Value {
-    json!({"world_id":row.get::<Uuid,_>("world_id"),"world_address":row.get::<Uuid,_>("world_address"),"revision":row.get::<i64,_>("revision"),"listing":row.get::<Value,_>("listing")})
+    let listing: Value = row.get("listing");
+    json!({"full": row.get::<i32,_>("reserved_seats") >= listing["player_limit"].as_i64().unwrap_or(0) as i32, "reserved_seats":row.get::<i32,_>("reserved_seats"), "claimed_seats":row.get::<i32,_>("claimed_seats"), "world_id":row.get::<Uuid,_>("world_id"),"world_address":row.get::<Uuid,_>("world_address"),"revision":row.get::<i64,_>("revision"),"listing":row.get::<Value,_>("listing")})
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Capacity {
+    revision: i64,
+    reserved: i32,
+    claimed: i32,
+}
+impl Capacity {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.revision < 0
+            || self.revision == i64::MAX
+            || !(0..=1000).contains(&self.reserved)
+            || !(0..=self.reserved).contains(&self.claimed)
+        {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_capacity"));
+        }
+        Ok(())
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityUpdate {
+    expected_directory_revision: i64,
+    capacity: Capacity,
+    remove_listing: bool,
+}
+
+fn require_capacity_revision(
+    row: &sqlx::postgres::PgRow,
+    value: &Capacity,
+) -> Result<(), ApiError> {
+    let revision: i64 = row.get("admission_revision");
+    if value.revision < revision
+        || value.revision == revision
+            && (value.reserved != row.get::<i32, _>("reserved_seats")
+                || value.claimed != row.get::<i32, _>("claimed_seats"))
+    {
+        return Err(ApiError(StatusCode::CONFLICT, "capacity_conflict"));
+    }
+    Ok(())
+}
+
+pub async fn capacity(
+    State(db): State<PgPool>,
+    Path((world, address)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(change): Json<CapacityUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "administrator_required"))?;
+    change.capacity.validate()?;
+    let mut tx = db.begin().await?;
+    let row = sqlx::query("SELECT administrator_digest,revision,listing,admission_revision,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 FOR UPDATE")
+        .bind(world).bind(address).fetch_optional(&mut *tx).await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND,"listing_not_found"))?;
+    if row.get::<Vec<u8>, _>("administrator_digest") != Sha256::digest(token.as_bytes()).to_vec() {
+        return Err(ApiError(StatusCode::FORBIDDEN, "administrator_mismatch"));
+    }
+    if row.get::<i64, _>("revision") != change.expected_directory_revision {
+        return Err(ApiError(StatusCode::CONFLICT, "revision_conflict"));
+    }
+    require_capacity_revision(&row, &change.capacity)?;
+    let listing: Option<Value> = row.get("listing");
+    if !change.remove_listing
+        && listing.as_ref().is_some_and(|l| {
+            change.capacity.reserved as i64 > l["player_limit"].as_i64().unwrap_or(0)
+        })
+    {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_capacity"));
+    }
+    let fully_claimed = listing.as_ref().is_some_and(|l| {
+        change.capacity.claimed as i64 >= l["player_limit"].as_i64().unwrap_or(i64::MAX)
+    });
+    sqlx::query("UPDATE world_addresses SET admission_revision=$3,reserved_seats=$4,claimed_seats=$5,listing=CASE WHEN $6 THEN NULL ELSE listing END WHERE world_id=$1 AND world_address=$2")
+        .bind(world).bind(address).bind(change.capacity.revision).bind(change.capacity.reserved)
+        .bind(change.capacity.claimed).bind(change.remove_listing || fully_claimed).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!({"revision":change.capacity.revision})))
 }

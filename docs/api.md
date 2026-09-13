@@ -2,7 +2,7 @@
 
 The API prefix is `/api/v1`. JSON uses snake_case. HTTPS is required outside
 loopback development. This release provides Directory publication/discovery and direct WebRTC setup;
-Join Requests, Invitations, admission and TURN are unavailable.
+World Authority Invitation claims use the direct encrypted control channel. Join Requests, gameplay admission and TURN remain unavailable.
 The service neither stores Worlds nor authenticates Participants.
 
 `GET /health` checks PostgreSQL and migration readiness. `GET /live` checks the
@@ -91,5 +91,31 @@ locator or replay 409. Bodies, credentials, proofs and SDP are never logged.
 
 The Rookframe control endpoint uses native SceneMultiplayer authentication data;
 transport authentication does not call `complete_auth`, load client Packages,
-create a World Session or enable gameplay RPCs. No Invitation, Join Request,
-Participant admission, TURN allocation or relay attempt is implemented here.
+create a World Session or enable gameplay RPCs. Invitation claim receipts and safe Package requirements travel directly between applications, never through this service. Join Requests, gameplay admission, TURN allocation and relay attempts remain subsequent work.
+
+## Invitation capacity (RFG-236)
+
+Directory entries additionally contain `reserved_seats`, `claimed_seats` and
+`full`. Reservations count all pre-created Player Seats, including claimed Seats,
+and exclude the GM. Fully reserved listings remain discoverable as Full, after
+accepting listings in browse order.
+
+Publication accepts `capacity: { revision, reserved, claimed }`; omitted capacity
+means the original zero-Seat state. Admission revision is nonnegative and
+monotonic, with identical counts required for an equal revision. Counts obey
+`0 <= claimed <= reserved <= 1000`. Public publication refuses a Player Limit
+below reserved Seats or at/below claimed Seats.
+
+`PUT /worlds/{world_id}/{world_address}/capacity` authenticates the same
+administrator capability and accepts `expected_directory_revision`, `capacity`
+and `remove_listing`. It serializes on the address, rejects stale revisions (409),
+updates counts, and removes the listing when requested or fully claimed. It never
+creates a listing or increments the Directory revision. A delayed cleanup cannot
+remove an explicitly republished newer Directory revision. A repeated old publish
+operation returns its receipt without recreating a removed listing.
+
+The running World first commits a claim locally, including automatic Private
+visibility on the final claim, then asynchronously retries this projection every
+ten seconds. A failed service update does not undo the Seat or block preparation.
+The service receives counts only: no Invitation secrets, installation keys, Seat
+credentials, Player names, World saves or Package archives.

@@ -3,7 +3,7 @@
 An accountless, replaceable World Directory and temporary WebRTC setup exchange. Rust / axum, PostgreSQL, versioned
 HTTP API. AGPL-3.0-only; the running deployment serves its exact corresponding
 source at `/source.tar.gz`. The service publishes/discovers Worlds and resolves direct encrypted connectivity;
-Participant admission and TURN remain subsequent work.
+It also projects Invitation capacity into Directory listings. Invitation identity lives in the World Authority; gameplay admission and TURN remain subsequent work.
 
 ## Clean clone
 

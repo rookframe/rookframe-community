@@ -249,3 +249,67 @@ async fn invalid_cover_links_never_poison_anonymous_directory_results(db: PgPool
     let (_, page) = request(&app, "GET", "/worlds", Value::Null, None).await;
     assert!(page["listings"].as_array().unwrap().is_empty());
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn capacity_is_full_then_removed_without_republishing_on_replay(db: PgPool) {
+    let app = rookframe_community::router(db);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let publish = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":listing()});
+    assert_eq!(
+        request(&app, "PUT", &path, publish, Some(ADMIN)).await.0,
+        StatusCode::OK
+    );
+    let capacity_path = format!("{path}/capacity");
+    let reserved = json!({"expected_directory_revision":1,"capacity":{"revision":1,"reserved":5,"claimed":0},"remove_listing":false});
+    assert_eq!(
+        request(&app, "PUT", &capacity_path, reserved.clone(), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, "PUT", &capacity_path, reserved.clone(), Some(ADMIN))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, entry) = request(&app, "GET", &path, Value::Null, None).await;
+    assert_eq!(entry["full"], true);
+    assert_eq!(entry["reserved_seats"], 5);
+    let claimed = json!({"expected_directory_revision":1,"capacity":{"revision":2,"reserved":5,"claimed":5},"remove_listing":true});
+    assert_eq!(
+        request(&app, "PUT", &capacity_path, claimed.clone(), Some(ADMIN))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &capacity_path, reserved, Some(ADMIN))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let republish = json!({"operation_id":Uuid::new_v4(),"expected_revision":1,"listing":listing(),"capacity":{"revision":3,"reserved":4,"claimed":4}});
+    assert_eq!(
+        request(&app, "PUT", &path, republish, Some(ADMIN)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "PUT", &capacity_path, claimed, Some(ADMIN))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.0,
+        StatusCode::OK
+    );
+}
