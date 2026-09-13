@@ -24,7 +24,9 @@ and `listing` (object for publication, null for removal). Required listing field
 `name` (1–100 UTF-16 units), `description` (1–4000), `game_system` (1–200),
 `language` (1–100), `player_limit` (integer 1–1000). Optional `schedule` is at most
 500 units; optional `cover_image` is an HTTPS URL at most 2048 units. The server
-never fetches covers. Inputs must be trimmed and may not contain control characters.
+never fetches covers. Inputs must be trimmed. Only `description` permits CR/LF line
+breaks; other control characters are rejected, and all other fields reject every
+control character. The description's 4000-unit bound includes its line breaks.
 
 The transaction authenticates ownership, serializes changes to this address,
 checks the expected revision, and commits the listing/removal together with a

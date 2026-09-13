@@ -106,16 +106,19 @@ pub async fn publish(
 
 impl Listing {
     fn validate(&self) -> Result<(), ApiError> {
-        for (text, maximum) in [
-            (&self.name, 100),
-            (&self.description, 4000),
-            (&self.game_system, 200),
-            (&self.language, 100),
+        for (text, maximum, allow_line_breaks) in [
+            (&self.name, 100, false),
+            (&self.description, 4000, true),
+            (&self.game_system, 200, false),
+            (&self.language, 100, false),
         ] {
             if text.is_empty()
                 || text.trim() != text
                 || text.encode_utf16().count() > maximum
-                || text.chars().any(char::is_control)
+                || text.chars().any(|character| {
+                    character.is_control()
+                        && (!allow_line_breaks || !matches!(character, '\r' | '\n'))
+                })
             {
                 return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_listing"));
             }

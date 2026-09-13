@@ -43,6 +43,78 @@ fn listing() -> Value {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn paragraph_descriptions_round_trip_through_publication_and_anonymous_read(db: PgPool) {
+    let app = rookframe_community::router(db);
+    for line_break in ["\n", "\r\n", "\r"] {
+        let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let description = format!("First paragraph.{line_break}{line_break}Second paragraph.");
+        let mut data = listing();
+        data["description"] = json!(description);
+        let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":data});
+        assert_eq!(
+            request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+            StatusCode::OK
+        );
+        let (_, read) = request(&app, "GET", &path, Value::Null, None).await;
+        assert_eq!(read["listing"]["description"], description);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_description_accepts_line_breaks_and_other_controls_are_rejected(db: PgPool) {
+    let app = rookframe_community::router(db);
+    for field in [
+        "name",
+        "description",
+        "game_system",
+        "language",
+        "schedule",
+        "cover_image",
+    ] {
+        for control in ['\r', '\n', '\t', '\0', '\u{001b}', '\u{0085}'] {
+            if field == "description" && matches!(control, '\r' | '\n') {
+                continue;
+            }
+            let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+            let mut data = listing();
+            data[field] = json!(if field == "cover_image" {
+                format!("https://example.com/first{control}second.png")
+            } else {
+                format!("First{control}second")
+            });
+            let change =
+                json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":data});
+            assert_eq!(
+                request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+                StatusCode::BAD_REQUEST,
+                "field {field}, control {control:?}"
+            );
+        }
+    }
+    let (_, page) = request(&app, "GET", "/worlds", Value::Null, None).await;
+    assert!(page["listings"].as_array().unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn paragraph_descriptions_still_require_trimmed_and_bounded_text(db: PgPool) {
+    let app = rookframe_community::router(db);
+    for description in [
+        "\nParagraph".to_string(),
+        "Paragraph\r".to_string(),
+        "a".repeat(4001),
+    ] {
+        let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let mut data = listing();
+        data["description"] = json!(description);
+        let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":data});
+        assert_eq!(
+            request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn administrator_publishes_and_an_independent_reader_discovers_the_exact_world(db: PgPool) {
     let app = rookframe_community::router(db);
     let world = Uuid::new_v4();
