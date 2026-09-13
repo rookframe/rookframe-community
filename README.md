@@ -1,9 +1,9 @@
 # Rookframe Community Server
 
-An accountless, replaceable World Directory. Rust / axum, PostgreSQL, versioned
+An accountless, replaceable World Directory and temporary WebRTC setup exchange. Rust / axum, PostgreSQL, versioned
 HTTP API. AGPL-3.0-only; the running deployment serves its exact corresponding
-source at `/source.tar.gz`. This first slice publishes and discovers Worlds;
-connection setup and admission are subsequent work.
+source at `/source.tar.gz`. The service publishes/discovers Worlds and resolves direct encrypted connectivity;
+Participant admission and TURN remain subsequent work.
 
 ## Clean clone
 

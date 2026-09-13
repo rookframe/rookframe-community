@@ -66,3 +66,19 @@ ownership and retry receipts so stale publication requests cannot resurrect data
 Service moderation, retention cleanup, edits/check-in and lifecycle synchronization
 are later slices; operation receipts currently remain until operator-managed
 retention can be introduced with an explicit retry horizon.
+
+## Setup operations
+
+Direct WebRTC setup uses the same deployment and address. No new database
+migration or externally reachable port is required. The service authenticates
+World availability against the existing address reservation, then holds its
+30-second locator lease and 60-second attempts only in bounded memory. Setup
+messages are not backed up. A service restart clears pending setup; clients retry
+with a new attempt while World Authorities renew availability. Existing direct
+connections continue independently. See the API contract for payload, concurrency
+and rate limits. Monitor aggregate availability/429/503 counts without logging
+request bodies, authorization, SDP, candidates, proofs or private URLs.
+
+There is no TURN server in this deployment. The application currently uses
+Cloudflare's public STUN facility for direct-route discovery; no relay credentials
+are issued. The Community Server does not receive gameplay traffic.

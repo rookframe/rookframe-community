@@ -1,5 +1,6 @@
 mod directory;
 mod error;
+mod setup;
 
 use axum::{
     Json, Router,
@@ -21,6 +22,8 @@ pub fn router(db: PgPool) -> Router {
             "/api/v1/worlds/{world}/{address}",
             get(directory::read).put(directory::publish),
         )
+        .with_state(db.clone())
+        .merge(setup::router(db))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(
             tower::ServiceBuilder::new()
@@ -33,7 +36,6 @@ pub fn router(db: PgPool) -> Router {
                 .concurrency_limit(64)
                 .timeout(std::time::Duration::from_secs(15)),
         )
-        .with_state(db)
 }
 
 async fn health(State(db): State<PgPool>) -> Result<Json<Value>, error::ApiError> {
