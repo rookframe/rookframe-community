@@ -1,5 +1,6 @@
 //! Temporary, bounded rendezvous only. This module never admits a Participant.
 use crate::error::ApiError;
+use crate::turn::{IceConfiguration, TurnProvider};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -26,9 +27,13 @@ const ATTEMPT_TTL: Duration = Duration::from_secs(60);
 struct SetupService {
     db: PgPool,
     book: Arc<Mutex<Book>>,
+    turn: TurnProvider,
 }
 struct Book {
     leases: HashMap<WorldKey, Lease>,
+    grants: HashMap<(Uuid, Uuid, Uuid, bool), RelayGrant>,
+    issued: usize,
+    issue_window: Instant,
     rate_start: Instant,
     requests: usize,
 }
@@ -42,7 +47,8 @@ struct Lease {
 }
 struct Attempt {
     digest: Vec<u8>,
-    offer: Offer,
+    begin: Begin,
+    offer: Option<Offer>,
     answer: Option<Description>,
     peer_id: i32,
     expires: Instant,
@@ -64,6 +70,23 @@ struct Description {
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Begin {
+    peer_id: i32,
+    locator: Uuid,
+    proof: String,
+}
+
+struct RelayGrant {
+    digest: Vec<u8>,
+    admin: Vec<u8>,
+    expires: Instant,
+    revoked: bool,
+    result:
+        tokio::sync::watch::Receiver<Option<Result<IceConfiguration, (StatusCode, &'static str)>>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Offer {
     peer_id: i32,
     locator: Uuid,
@@ -77,9 +100,12 @@ struct Locator {
     locator: Uuid,
 }
 
-pub fn router(db: PgPool) -> Router {
+pub fn router(db: PgPool, turn: TurnProvider) -> Router {
     let book = Arc::new(Mutex::new(Book {
         leases: HashMap::new(),
+        grants: HashMap::new(),
+        issued: 0,
+        issue_window: Instant::now(),
         rate_start: Instant::now(),
         requests: 0,
     }));
@@ -107,13 +133,21 @@ pub fn router(db: PgPool) -> Router {
         )
         .route(
             "/api/v1/setup/worlds/{world}/{address}/connections/{attempt}",
-            get(read).put(offer).delete(remove),
+            get(read).post(begin).put(offer).delete(remove),
         )
         .route(
             "/api/v1/setup/worlds/{world}/{address}/connections/{attempt}/answer",
             axum::routing::put(answer),
         )
-        .with_state(SetupService { db, book })
+        .route(
+            "/api/v1/setup/worlds/{world}/{address}/connections/{attempt}/ice",
+            axum::routing::post(host_ice),
+        )
+        .route(
+            "/api/v1/setup/worlds/{world}/{address}/connections/{attempt}/relay",
+            axum::routing::delete(revoke_relay),
+        )
+        .with_state(SetupService { db, book, turn })
 }
 
 fn missing() -> ApiError {
@@ -181,6 +215,7 @@ fn merge_candidates(retained: &mut Vec<Candidate>, incoming: &[Candidate]) -> Re
 }
 impl Book {
     fn expire(&mut self, now: Instant) {
+        self.grants.retain(|_, grant| grant.expires > now);
         self.leases.retain(|_, lease| {
             lease.attempts.retain(|_, attempt| attempt.expires > now);
             lease.expires > now
@@ -329,13 +364,225 @@ async fn pending(
     let connections: Vec<Value> = lease
         .attempts
         .iter()
-        .map(|(id, attempt)| {
-            json!({"attempt_id":id,"peer_id":attempt.peer_id,
-        "sdp":attempt.offer.sdp,"candidates":attempt.offer.candidates,"proof":attempt.offer.proof})
+        .filter_map(|(id, attempt)| {
+            attempt.offer.as_ref().map(|offer| {
+                json!({"attempt_id":id,"peer_id":attempt.peer_id,
+                "sdp":offer.sdp,"candidates":offer.candidates,"proof":attempt.begin.proof})
+            })
         })
         .collect();
     Ok(Json(json!({"connections":connections})))
 }
+async fn begin(
+    State(service): State<SetupService>,
+    Path((world, address, id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<Begin>,
+) -> Result<(HeaderMap, Json<IceConfiguration>), ApiError> {
+    let digest = token(&headers)?;
+    if !valid_id(id)
+        || !valid_id(input.locator)
+        || input.peer_id <= 1
+        || !valid_secret(&input.proof)
+    {
+        return Err(invalid());
+    }
+    {
+        let mut book = service.lock()?;
+        let lease = book.lease((world, address))?;
+        lease.locate(input.locator)?;
+        if let Some(attempt) = lease.attempts.get_mut(&id) {
+            attempt.access(&digest)?;
+            if attempt.begin.peer_id != input.peer_id || attempt.begin.proof != input.proof {
+                return Err(ApiError(StatusCode::CONFLICT, "setup_conflict"));
+            }
+        } else {
+            let now = Instant::now();
+            if now.duration_since(lease.rate_start) >= Duration::from_secs(60) {
+                lease.opened = 0;
+                lease.rate_start = now;
+            }
+            if lease.attempts.len() >= 8 || lease.opened >= 16 {
+                return Err(busy());
+            }
+            if lease.attempts.values().any(|a| a.peer_id == input.peer_id) {
+                return Err(ApiError(StatusCode::CONFLICT, "peer_id_conflict"));
+            }
+            lease.opened += 1;
+            lease.attempts.insert(
+                id,
+                Attempt {
+                    digest: digest.clone(),
+                    peer_id: input.peer_id,
+                    begin: input,
+                    offer: None,
+                    answer: None,
+                    expires: now + ATTEMPT_TTL,
+                    requests: 1,
+                },
+            );
+        }
+    }
+    issue_ice(service, (world, address, id), digest, false).await
+}
+
+async fn host_ice(
+    State(service): State<SetupService>,
+    Path(ids): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<Locator>,
+) -> Result<(HeaderMap, Json<IceConfiguration>), ApiError> {
+    let digest = token(&headers)?;
+    {
+        let mut book = service.lock()?;
+        let lease = book.lease((ids.0, ids.1))?;
+        lease.authorize(&digest)?;
+        lease.locate(input.locator)?;
+        if !lease.attempts.contains_key(&ids.2) {
+            return Err(missing());
+        }
+    }
+    issue_ice(service, ids, digest, true).await
+}
+
+async fn issue_ice(
+    service: SetupService,
+    ids: (Uuid, Uuid, Uuid),
+    digest: Vec<u8>,
+    host: bool,
+) -> Result<(HeaderMap, Json<IceConfiguration>), ApiError> {
+    let key = (ids.0, ids.1, ids.2, host);
+    let mut result = {
+        let mut book = service.lock()?;
+        if !book.grants.contains_key(&key) {
+            let now = Instant::now();
+            if now.duration_since(book.issue_window) >= Duration::from_secs(60) {
+                book.issued = 0;
+                book.issue_window = now;
+            }
+            if book.grants.len() >= 1024
+                || book.issued >= 64
+                || book
+                    .grants
+                    .keys()
+                    .filter(|k| k.0 == ids.0 && k.1 == ids.1)
+                    .count()
+                    >= 128
+            {
+                return Err(busy());
+            }
+            let admin = book.lease((ids.0, ids.1))?.admin.clone();
+            let principal = Uuid::new_v4();
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            book.grants.insert(
+                key,
+                RelayGrant {
+                    digest: digest.clone(),
+                    admin,
+                    expires: now + service.turn.ttl(),
+                    revoked: false,
+                    result: receiver,
+                },
+            );
+            book.issued += 1;
+            let provider = service.turn.clone();
+            // One bounded issuance survives an HTTP cancellation. Retries observe
+            // its result, and never mint another credential for the same principal.
+            tokio::spawn(async move {
+                let result = provider.issue(principal).await.map_err(|e| (e.0, e.1));
+                tracing::info!(
+                    principal = %principal,
+                    outcome = if result.is_ok() { "issued" } else { "failed" },
+                    "turn_issuance"
+                );
+                let _ = sender.send(Some(result));
+            });
+        }
+        let grant = &book.grants[&key];
+        if grant.digest != digest {
+            return Err(ApiError(StatusCode::FORBIDDEN, "setup_credential_mismatch"));
+        }
+        if grant.revoked {
+            return Err(ApiError(StatusCode::FORBIDDEN, "relay_credential_revoked"));
+        }
+        grant.result.clone()
+    };
+    let configuration = credential_result(&mut result).await?;
+    {
+        let mut book = service.lock()?;
+        let grant = book.grants.get(&key).ok_or_else(missing)?;
+        if grant.revoked {
+            return Err(ApiError(StatusCode::FORBIDDEN, "relay_credential_revoked"));
+        }
+        // A request delayed beyond setup lifetime cannot disclose new material.
+        if !book.lease((ids.0, ids.1))?.attempts.contains_key(&ids.2) {
+            return Err(missing());
+        }
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    Ok((headers, Json(configuration)))
+}
+
+async fn credential_result(
+    result: &mut tokio::sync::watch::Receiver<
+        Option<Result<IceConfiguration, (StatusCode, &'static str)>>,
+    >,
+) -> Result<IceConfiguration, ApiError> {
+    if result.borrow().is_none() {
+        result
+            .changed()
+            .await
+            .map_err(|_| crate::turn::unavailable())?;
+    }
+    result
+        .borrow()
+        .clone()
+        .ok_or_else(crate::turn::unavailable)?
+        .map_err(|e| ApiError(e.0, e.1))
+}
+
+async fn revoke_relay(
+    State(service): State<SetupService>,
+    Path(ids): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let digest = token(&headers)?;
+    let mut results = Vec::new();
+    {
+        let mut book = service.lock()?;
+        for host in [false, true] {
+            if let Some(grant) = book.grants.get(&(ids.0, ids.1, ids.2, host))
+                && grant.digest != digest
+                && grant.admin != digest
+            {
+                // A client revokes its own credential; only the administrator
+                // can revoke the authority's credential too.
+                if !host {
+                    return Err(ApiError(StatusCode::FORBIDDEN, "setup_credential_mismatch"));
+                }
+            }
+        }
+        for host in [false, true] {
+            if let Some(grant) = book.grants.get_mut(&(ids.0, ids.1, ids.2, host))
+                && (grant.digest == digest || grant.admin == digest)
+            {
+                grant.revoked = true;
+                results.push(grant.result.clone());
+            }
+        }
+    }
+    let mut provider_revoked = true;
+    for mut result in results {
+        if let Ok(configuration) = credential_result(&mut result).await {
+            provider_revoked &= service.turn.revoke(&configuration).await?;
+        }
+    }
+    Ok(Json(
+        json!({"issuance_revoked":true,"provider_revoked":provider_revoked}),
+    ))
+}
+
 async fn offer(
     State(service): State<SetupService>,
     Path((world, address, id)): Path<(Uuid, Uuid, Uuid)>,
@@ -350,44 +597,18 @@ async fn offer(
     let mut book = service.lock()?;
     let lease = book.lease((world, address))?;
     lease.locate(input.locator)?;
-    if let Some(attempt) = lease.attempts.get_mut(&id) {
-        attempt.access(&digest)?;
-        if attempt.peer_id != input.peer_id
-            || attempt.offer.sdp != input.sdp
-            || attempt.offer.proof != input.proof
-        {
+    let attempt = lease.attempts.get_mut(&id).ok_or_else(missing)?;
+    attempt.access(&digest)?;
+    if attempt.peer_id != input.peer_id || attempt.begin.proof != input.proof {
+        return Err(ApiError(StatusCode::CONFLICT, "setup_conflict"));
+    }
+    if let Some(offer) = &mut attempt.offer {
+        if offer.sdp != input.sdp {
             return Err(ApiError(StatusCode::CONFLICT, "setup_conflict"));
         }
-        merge_candidates(&mut attempt.offer.candidates, &input.candidates)?;
+        merge_candidates(&mut offer.candidates, &input.candidates)?;
     } else {
-        let now = Instant::now();
-        if now.duration_since(lease.rate_start) >= Duration::from_secs(60) {
-            lease.opened = 0;
-            lease.rate_start = now;
-        }
-        if lease.attempts.len() >= 8 || lease.opened >= 16 {
-            return Err(busy());
-        }
-        let peer_id = input.peer_id;
-        if lease
-            .attempts
-            .values()
-            .any(|attempt| attempt.peer_id == peer_id)
-        {
-            return Err(ApiError(StatusCode::CONFLICT, "peer_id_conflict"));
-        }
-        lease.opened += 1;
-        lease.attempts.insert(
-            id,
-            Attempt {
-                digest,
-                offer: input,
-                answer: None,
-                peer_id,
-                expires: now + ATTEMPT_TTL,
-                requests: 1,
-            },
-        );
+        attempt.offer = Some(input);
     }
     Ok(Json(lease.attempts[&id].reply(id)))
 }

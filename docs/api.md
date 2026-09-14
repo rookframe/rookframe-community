@@ -1,11 +1,16 @@
 # Community Server API v1
 
 The API prefix is `/api/v1`. JSON uses snake_case. HTTPS is required outside
-loopback development. This release provides Directory publication/discovery and direct WebRTC setup;
-World Authority Invitation claims use the direct encrypted control channel. Join Requests, gameplay admission and TURN remain unavailable.
+loopback development. This release provides Directory publication/discovery,
+WebRTC signaling and provider-neutral UDP TURN credentials. World Authority
+Invitation claims and Player authentication use the encrypted application channel.
 The service neither stores Worlds nor authenticates Participants.
 
-`GET /health` checks PostgreSQL and migration readiness. `GET /live` checks the
+`GET /health` checks PostgreSQL, migration readiness and configured TURN issuance
+state (503 after an observed issuance failure until a successful issuance). It
+does not probe the provider or prove that allocations work. `GET /metrics` exposes
+aggregate issuance/revocation counters, with no credential or principal labels.
+`GET /live` checks the
 process. `GET /worlds?q=words&offset=0&limit=30` returns `listings` and optional
 `next_offset`. `GET /worlds/{world_id}/{world_address}` returns one listing or
 404. Each entry contains both UUIDv4 identifiers, `revision`, and `listing`.
@@ -43,7 +48,7 @@ operation. Report final success only after the HTTP result and the coherent loca
 World commit. Retain a failed local commit for retry without issuing a new remote
 operation. New Private Worlds do not need this service.
 
-## Direct WebRTC setup (RFG-235)
+## WebRTC setup (RFG-235, RFG-243)
 
 The same HTTPS origin exposes `/api/v1/setup/worlds/{world_id}/{world_address}`.
 `PUT` with the existing administrator Bearer capability and `{ "locator": UUIDv4 }`
@@ -56,7 +61,13 @@ all pending attempts, and cannot revoke a different lifetime.
 
 An installation chooses a random UUIDv4 attempt, a random peer ID in 2..2147483647,
 and two independent cryptographic 32-byte hexadecimal secrets: its temporary
-Bearer credential and a control proof. It creates native WebRTC channels, then
+Bearer credential and a control proof. First `POST .../connections/{attempt}` with
+`locator`, `peer_id` and `proof` reserves the attempt and returns
+`{ ice_servers: [{ urls: [...], username?, credential? }], expires_at, principal }`.
+The principal is an opaque UUIDv4 for provider attribution, not Player identity.
+Responses are `Cache-Control: no-store`. ICE contains direct discovery plus UDP
+TURN URLs; it never contains a backend provider token or shared secret. Initialize
+stock WebRTC using this configuration before creating the offer, then
 `PUT .../connections/{attempt}` with `locator`, `peer_id`, `sdp` (the offer),
 `candidates` and `proof`. Each candidate has `mid`, `index` and `candidate`.
 Exact retries return the same attempt; SDP, proof and peer ID cannot change.
@@ -72,6 +83,15 @@ private offer queue or renew/revoke availability. Each client may read/update
 only its own attempt. Client peer IDs never include Authority peer 1 and have
 no Participant meaning.
 
+Before creating its native connection, the administrator sends
+`POST .../connections/{attempt}/ice` with `{ locator }` and its administration
+Bearer credential. This returns a separately attributed ICE configuration. Each
+side receives the same retained issuance result on retry; cancellation does not
+mint extra credentials. Provider calls have a five-second deadline, at most four
+in flight and no automatic provider retries. A new attempt is required after a
+failed issuance. Credentials last six hours by default (operator range 300–86400
+seconds); credential expiry does not extend the 60-second setup lifetime.
+
 After its encrypted control handshake completes, the client deletes the attempt
 with `DELETE .../connections/{attempt}`. Either its credential or the World
 administrator can delete it. Clients also delete on cancel/failure. Attempts have
@@ -81,17 +101,39 @@ are volatile, removed on expiry or process restart, and swept every five seconds
 without waiting for a request. Established WebRTC connections do not use this
 service and survive its loss.
 
+Signaling deletion does **not** revoke the relay supporting established gameplay.
+On cancel/disconnect, `DELETE .../connections/{attempt}/relay` separately denies
+further issuance and attempts provider revocation. The client can revoke its own
+grant; the administrator can revoke both sides. The reply contains
+`issuance_revoked` and `provider_revoked`. Cloudflare revokes issued usernames;
+coturn shared-secret credentials have no individual revocation API and return
+`provider_revoked: false`: they remain valid until expiry. See emergency operator
+revocation and session-duration constraints in the operations guide. Failed
+Cloudflare revocation returns 503 and may be retried. Restart loses the volatile
+revocation book; provider credentials remain bounded by their original expiry.
+
 Bounds: 32 KiB request body; 16 KiB SDP; 32 distinct candidates per side (each
 candidate at most 2048 bytes and mid 64 bytes); eight pending attempts and sixteen
 new attempts/minute per World lifetime; 150 client operations/attempt; 512 live
 World leases; 200 setup operations/second globally; the existing 64 concurrent
 requests and 15-second HTTP deadlines also apply. Excess load returns 429/503.
+TURN additionally allows 64 issuances/minute globally and retains at most 128
+grants per World and 1024 globally until expiry, including revoked or failed
+grants. Both sides count separately. Provider bandwidth/allocation quotas are
+also required: HTTP issuance bounds do not bound relay bytes.
 Missing/expired World or attempt returns 404; wrong credentials 401/403; conflicting
 locator or replay 409. Bodies, credentials, proofs and SDP are never logged.
+`503 relay_unavailable` means issuance failed; it does not diagnose a client's ICE
+path. `403 relay_credential_revoked` is an evidenced revoked grant. Clients reject
+configuration that is expired or cannot cover their remaining setup deadline.
 
 The Rookframe control endpoint uses native SceneMultiplayer authentication data;
-transport authentication does not call `complete_auth`, load client Packages,
-create a World Session or enable gameplay RPCs. Invitation claim receipts and safe Package requirements travel directly between applications, never through this service. Join Requests, gameplay admission, TURN allocation and relay attempts remain subsequent work.
+transport authentication alone does not call `complete_auth`, load client Packages,
+create a World Session or enable gameplay RPCs. Invitation claim receipts and safe
+Package requirements travel between applications, never through this service.
+The existing World Authority Player authentication and bootstrap gate then admits
+prepared Players identically for direct and relayed connections. TURN/TCP and
+TURN/TLS are not supported.
 
 ## Invitation capacity (RFG-236)
 

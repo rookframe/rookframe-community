@@ -1,6 +1,8 @@
 mod directory;
 mod error;
 mod setup;
+mod turn;
+pub use turn::TurnProvider;
 
 use axum::{
     Json, Router,
@@ -11,8 +13,33 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 pub fn router(db: PgPool) -> Router {
+    router_with_turn(db, TurnProvider::disabled())
+}
+
+pub fn router_with_turn(db: PgPool, turn: TurnProvider) -> Router {
+    let health_turn = turn.clone();
+    let metrics_turn = turn.clone();
     Router::new()
-        .route("/api/v1/health", get(health))
+        .route(
+            "/api/v1/health",
+            get(move |State(db): State<PgPool>| {
+                let turn = health_turn.clone();
+                async move {
+                    let result = health(State(db)).await?;
+                    if !turn.ready() {
+                        return Err(turn::unavailable());
+                    }
+                    Ok(result)
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics_turn.metrics();
+                async move { ([("content-type", "text/plain; version=0.0.4")], metrics) }
+            }),
+        )
         .route(
             "/api/v1/live",
             get(|| async { Json(json!({"status":"ok"})) }),
@@ -27,7 +54,7 @@ pub fn router(db: PgPool) -> Router {
             axum::routing::put(directory::capacity),
         )
         .with_state(db.clone())
-        .merge(setup::router(db))
+        .merge(setup::router(db, turn))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(
             tower::ServiceBuilder::new()

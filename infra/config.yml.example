@@ -1,3 +1,11 @@
 domain: community.example.com
 # Generate with: openssl rand -hex 32
 database_password: REPLACE_WITH_64_RANDOM_HEX_CHARACTERS
+turn_provider: cloudflare
+turn_ttl_seconds: 21600
+cloudflare_turn_key_id: REPLACE_WITH_TURN_KEY_ID
+cloudflare_turn_api_token: REPLACE_WITH_BACKEND_ONLY_TURN_TOKEN
+# For independent hosting set turn_provider: coturn and replace these values.
+# No Cloudflare account or credentials are used in coturn mode.
+# coturn_urls: 'stun:relay.example.com:3478,turn:relay.example.com:3478?transport=udp'
+# coturn_shared_secret: REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES

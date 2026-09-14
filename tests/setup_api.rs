@@ -12,6 +12,134 @@ use uuid::Uuid;
 const ADMIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CLIENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[sqlx::test(migrations = "./migrations")]
+async fn relay_credentials_are_attempt_bound_and_setup_deletion_does_not_revoke_play(db: PgPool) {
+    let turn = rookframe_community::TurnProvider::coturn(
+        vec![
+            "stun:relay.example:3478".into(),
+            "turn:relay.example:3478?transport=udp".into(),
+        ],
+        "backend-only-secret-with-at-least-32-bytes".into(),
+        21600,
+    )
+    .unwrap();
+    let app = rookframe_community::router_with_turn(db, turn);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let locator = Uuid::new_v4();
+    request(&app, "PUT", &path, json!({"locator":locator}), Some(ADMIN)).await;
+    let connection = format!("{path}/connections/{}", Uuid::new_v4());
+    let begin = json!({"locator":locator,"peer_id":42,"proof":CLIENT});
+    let (status, ice) = request(&app, "POST", &connection, begin.clone(), Some(CLIENT)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ice["ice_servers"][1]["urls"][0],
+        "turn:relay.example:3478?transport=udp"
+    );
+    assert!(!ice.to_string().contains("backend-only"));
+    assert!(ice["ice_servers"][1]["credential"].as_str().unwrap().len() > 20);
+    assert_eq!(
+        request(&app, "POST", &connection, begin.clone(), Some(CLIENT))
+            .await
+            .1,
+        ice
+    );
+    assert_eq!(
+        request(&app, "POST", &connection, begin, Some(ADMIN))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "DELETE", &connection, Value::Null, Some(CLIENT))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // Signaling is temporary; a separate authorized operation revokes relay use.
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("{connection}/relay"),
+            Value::Null,
+            Some(CLIENT)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn revocation_refuses_reissuance_without_claiming_coturn_provider_revocation(db: PgPool) {
+    let provider = rookframe_community::TurnProvider::coturn(
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        "backend-only-secret-with-at-least-32-bytes".into(),
+        21600,
+    )
+    .unwrap();
+    let app = rookframe_community::router_with_turn(db, provider);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let locator = Uuid::new_v4();
+    request(&app, "PUT", &path, json!({"locator":locator}), Some(ADMIN)).await;
+    let connection = format!("{path}/connections/{}", Uuid::new_v4());
+    let begin = json!({"locator":locator,"peer_id":42,"proof":CLIENT});
+    assert_eq!(
+        request(&app, "POST", &connection, begin.clone(), Some(CLIENT))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("{connection}/ice"),
+            json!({"locator":locator}),
+            Some(CLIENT)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("{connection}/ice"),
+            json!({"locator":locator}),
+            Some(ADMIN)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, revoked) = request(
+        &app,
+        "DELETE",
+        &format!("{connection}/relay"),
+        Value::Null,
+        Some(ADMIN),
+    )
+    .await;
+    assert_eq!(
+        revoked,
+        json!({"issuance_revoked":true,"provider_revoked":false})
+    );
+    let (status, error) = request(&app, "POST", &connection, begin, Some(CLIENT)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], "relay_credential_revoked");
+}
+
+async fn reserve(app: &Router, path: &str, offer: &Value) {
+    let begin =
+        json!({"locator":offer["locator"],"peer_id":offer["peer_id"],"proof":offer["proof"]});
+    assert_eq!(
+        request(app, "POST", path, begin, Some(CLIENT)).await.0,
+        StatusCode::OK
+    );
+}
+
 async fn request(
     app: &Router,
     method: &str,
@@ -41,7 +169,15 @@ async fn request(
 
 #[sqlx::test(migrations = "./migrations")]
 async fn exact_private_world_setup_is_authenticated_and_removed_after_connection(db: PgPool) {
-    let app = rookframe_community::router(db);
+    let app = rookframe_community::router_with_turn(
+        db,
+        rookframe_community::TurnProvider::coturn(
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            "backend-only-secret-with-at-least-32-bytes".into(),
+            21600,
+        )
+        .unwrap(),
+    );
     let world = Uuid::new_v4();
     let address = Uuid::new_v4();
     let locator = Uuid::new_v4();
@@ -70,6 +206,7 @@ async fn exact_private_world_setup_is_authenticated_and_removed_after_connection
     let attempt = Uuid::new_v4();
     let connection = format!("{path}/connections/{attempt}");
     let offer = json!({"locator":locator,"peer_id":42,"sdp":"v=0\r\no=offer", "candidates":[],"proof":CLIENT});
+    reserve(&app, &connection, &offer).await;
     let (status, created) = request(&app, "PUT", &connection, offer, Some(CLIENT)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(created["peer_id"].as_i64().unwrap() > 1);
@@ -126,7 +263,15 @@ async fn exact_private_world_setup_is_authenticated_and_removed_after_connection
 
 #[sqlx::test(migrations = "./migrations")]
 async fn old_epochs_and_other_credentials_cannot_change_pending_setup(db: PgPool) {
-    let app = rookframe_community::router(db);
+    let app = rookframe_community::router_with_turn(
+        db,
+        rookframe_community::TurnProvider::coturn(
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            "backend-only-secret-with-at-least-32-bytes".into(),
+            21600,
+        )
+        .unwrap(),
+    );
     let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
     let locator = Uuid::new_v4();
     let lease = json!({"locator":locator});
@@ -157,6 +302,7 @@ async fn old_epochs_and_other_credentials_cannot_change_pending_setup(db: PgPool
     );
     let connection = format!("{path}/connections/{}", Uuid::new_v4());
     let offer = json!({"locator":locator,"peer_id":42,"sdp":"v=0","candidates":[],"proof":CLIENT});
+    reserve(&app, &connection, &offer).await;
     assert_eq!(
         request(&app, "PUT", &connection, offer.clone(), Some(CLIENT))
             .await
@@ -199,7 +345,15 @@ async fn old_epochs_and_other_credentials_cannot_change_pending_setup(db: PgPool
 
 #[sqlx::test(migrations = "./migrations")]
 async fn setup_bounds_reject_peer_one_oversized_payloads_and_excess_concurrency(db: PgPool) {
-    let app = rookframe_community::router(db);
+    let app = rookframe_community::router_with_turn(
+        db,
+        rookframe_community::TurnProvider::coturn(
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            "backend-only-secret-with-at-least-32-bytes".into(),
+            21600,
+        )
+        .unwrap(),
+    );
     let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
     let locator = Uuid::new_v4();
     request(&app, "PUT", &path, json!({"locator":locator}), Some(ADMIN)).await;
@@ -230,31 +384,41 @@ async fn setup_bounds_reject_peer_one_oversized_payloads_and_excess_concurrency(
     offer["sdp"] = json!("v=0");
     for peer in 2..10 {
         offer["peer_id"] = json!(peer);
+        let next = format!("{path}/connections/{}", Uuid::new_v4());
+        reserve(&app, &next, &offer).await;
         assert_eq!(
-            request(
-                &app,
-                "PUT",
-                &format!("{path}/connections/{}", Uuid::new_v4()),
-                offer.clone(),
-                Some(CLIENT)
-            )
-            .await
-            .0,
+            request(&app, "PUT", &next, offer.clone(), Some(CLIENT))
+                .await
+                .0,
             StatusCode::OK
         );
     }
     offer["peer_id"] = json!(99);
     assert_eq!(
-        request(&app, "PUT", &connection, offer, Some(CLIENT))
-            .await
-            .0,
+        request(
+            &app,
+            "POST",
+            &connection,
+            json!({"locator":locator,"peer_id":99,"proof":CLIENT}),
+            Some(CLIENT)
+        )
+        .await
+        .0,
         StatusCode::TOO_MANY_REQUESTS
     );
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn expired_worlds_are_unresolvable_without_a_reader_triggering_cleanup(db: PgPool) {
-    let app = rookframe_community::router(db);
+    let app = rookframe_community::router_with_turn(
+        db,
+        rookframe_community::TurnProvider::coturn(
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            "backend-only-secret-with-at-least-32-bytes".into(),
+            21600,
+        )
+        .unwrap(),
+    );
     let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
     let locator = Uuid::new_v4();
     assert_eq!(
@@ -275,7 +439,15 @@ async fn expired_worlds_are_unresolvable_without_a_reader_triggering_cleanup(db:
 async fn candidates_merge_idempotently_and_attempts_expire_while_the_world_stays_online(
     db: PgPool,
 ) {
-    let app = rookframe_community::router(db);
+    let app = rookframe_community::router_with_turn(
+        db,
+        rookframe_community::TurnProvider::coturn(
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            "backend-only-secret-with-at-least-32-bytes".into(),
+            21600,
+        )
+        .unwrap(),
+    );
     let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
     let locator = Uuid::new_v4();
     let lease = json!({"locator":locator});
@@ -283,6 +455,7 @@ async fn candidates_merge_idempotently_and_attempts_expire_while_the_world_stays
     let connection = format!("{path}/connections/{}", Uuid::new_v4());
     let mut offer =
         json!({"locator":locator,"peer_id":42,"sdp":"v=0","candidates":[],"proof":CLIENT});
+    reserve(&app, &connection, &offer).await;
     request(&app, "PUT", &connection, offer.clone(), Some(CLIENT)).await;
     offer["candidates"] =
         json!([{"mid":"0","index":0,"candidate":"candidate:1 1 UDP 1 127.0.0.1 1234 typ host"}]);

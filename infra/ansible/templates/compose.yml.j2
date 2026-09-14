@@ -26,6 +26,15 @@ services:
     environment:
       DATABASE_URL: {{ ('postgres://community:' + database_password + '@db/community') | to_json }}
       LISTEN_ADDR: '0.0.0.0:8080'
+      TURN_PROVIDER: {{ turn_provider | to_json }}
+      TURN_TTL_SECONDS: {{ (turn_ttl_seconds | default(21600) | string) | to_json }}
+{% if turn_provider == 'cloudflare' %}
+      CLOUDFLARE_TURN_KEY_ID: {{ cloudflare_turn_key_id | to_json }}
+      CLOUDFLARE_TURN_API_TOKEN: {{ cloudflare_turn_api_token | to_json }}
+{% elif turn_provider == 'coturn' %}
+      COTURN_URLS: {{ coturn_urls | to_json }}
+      COTURN_SHARED_SECRET: {{ coturn_shared_secret | to_json }}
+{% endif %}
     depends_on:
       db: {condition: service_healthy}
     healthcheck:

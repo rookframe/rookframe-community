@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     let address = env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("community_server_ready");
-    axum::serve(listener, rookframe_community::router(db))
+    let turn = rookframe_community::TurnProvider::from_env()?;
+    axum::serve(listener, rookframe_community::router_with_turn(db, turn))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

@@ -20,6 +20,10 @@ tower = { version = "0.5", features = ["limit", "load-shed", "timeout", "util"] 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

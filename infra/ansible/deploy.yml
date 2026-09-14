@@ -16,6 +16,9 @@
           - database_password is match('^[0-9a-f]{64}$')
           - domain is match('^[a-z0-9.-]+$')
           - release_revision is match('^[0-9a-f]{40}$')
+          - turn_provider in ['cloudflare', 'coturn']
+          - (turn_ttl_seconds | default(21600) | int) >= 300
+          - (turn_ttl_seconds | default(21600) | int) <= 86400
       no_log: true
     - name: Require the attached data volume to be mounted
       ansible.builtin.command: "mountpoint -q {{ data_path }}"

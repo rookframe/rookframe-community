@@ -2,8 +2,9 @@
 
 An accountless, replaceable World Directory and temporary WebRTC setup exchange. Rust / axum, PostgreSQL, versioned
 HTTP API. AGPL-3.0-only; the running deployment serves its exact corresponding
-source at `/source.tar.gz`. The service publishes/discovers Worlds and resolves direct encrypted connectivity;
-It also projects Invitation capacity into Directory listings. Invitation identity lives in the World Authority; gameplay admission and TURN remain subsequent work.
+source at `/source.tar.gz`. The service publishes/discovers Worlds, exchanges
+WebRTC setup, issues temporary UDP TURN credentials and projects Invitation
+capacity. Invitation identity and gameplay admission belong to the World Authority.
 
 ## Clean clone
 
@@ -16,12 +17,15 @@ cd rookframe-community
 export DATABASE_URL=postgres://localhost/community
 cargo run --locked -- migrate
 cargo run --locked
-curl --fail http://127.0.0.1:8080/api/v1/health
+curl --fail http://127.0.0.1:8080/api/v1/live
 ```
 
 The default listener is loopback. Set `LISTEN_ADDR` explicitly inside a trusted
 private reverse-proxy network. Do not expose PostgreSQL or plaintext app traffic.
 The lockfile pins Rust dependencies; OpenTofu has its own committed provider lock.
+TURN is disabled until configured; `/health` returns 503 in that state. Choose
+Cloudflare or independent coturn using the private configuration described in
+[operations](docs/operations.md#turn-provider-configuration).
 
 ## Focused validation
 
