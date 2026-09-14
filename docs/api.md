@@ -122,7 +122,8 @@ TURN additionally allows 64 issuances/minute globally and retains at most 128
 grants per World and 1024 globally until expiry, including revoked or failed
 grants. Both sides count separately. Provider bandwidth/allocation quotas are
 also required: HTTP issuance bounds do not bound relay bytes.
-Missing/expired World or attempt returns 404; wrong credentials 401/403; conflicting
+Missing/expired World returns `404 world_unavailable`; a missing/expired attempt
+on a live World returns `404 attempt_unavailable`. Wrong credentials 401/403; conflicting
 locator or replay 409. Bodies, credentials, proofs and SDP are never logged.
 `503 relay_unavailable` means issuance failed; it does not diagnose a client's ICE
 path. `403 relay_credential_revoked` is an evidenced revoked grant. Clients reject

@@ -53,6 +53,7 @@ struct Attempt {
     peer_id: i32,
     expires: Instant,
     requests: usize,
+    relay_revoked: bool,
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +82,7 @@ struct RelayGrant {
     admin: Vec<u8>,
     expires: Instant,
     revoked: bool,
+    revoke_all: bool,
     result:
         tokio::sync::watch::Receiver<Option<Result<IceConfiguration, (StatusCode, &'static str)>>>,
 }
@@ -152,6 +154,9 @@ pub fn router(db: PgPool, turn: TurnProvider) -> Router {
 
 fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "world_unavailable")
+}
+fn attempt_missing() -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, "attempt_unavailable")
 }
 fn busy() -> ApiError {
     ApiError(StatusCode::TOO_MANY_REQUESTS, "setup_limit")
@@ -419,6 +424,7 @@ async fn begin(
                     answer: None,
                     expires: now + ATTEMPT_TTL,
                     requests: 1,
+                    relay_revoked: false,
                 },
             );
         }
@@ -439,7 +445,7 @@ async fn host_ice(
         lease.authorize(&digest)?;
         lease.locate(input.locator)?;
         if !lease.attempts.contains_key(&ids.2) {
-            return Err(missing());
+            return Err(attempt_missing());
         }
     }
     issue_ice(service, ids, digest, true).await
@@ -454,6 +460,20 @@ async fn issue_ice(
     let key = (ids.0, ids.1, ids.2, host);
     let mut result = {
         let mut book = service.lock()?;
+        let attempt = book
+            .lease((ids.0, ids.1))?
+            .attempts
+            .get(&ids.2)
+            .ok_or_else(attempt_missing)?;
+        if attempt.relay_revoked
+            || [false, true].iter().any(|side| {
+                book.grants
+                    .get(&(ids.0, ids.1, ids.2, *side))
+                    .is_some_and(|grant| grant.revoke_all)
+            })
+        {
+            return Err(ApiError(StatusCode::FORBIDDEN, "relay_credential_revoked"));
+        }
         if !book.grants.contains_key(&key) {
             let now = Instant::now();
             if now.duration_since(book.issue_window) >= Duration::from_secs(60) {
@@ -481,6 +501,7 @@ async fn issue_ice(
                     admin,
                     expires: now + service.turn.ttl(),
                     revoked: false,
+                    revoke_all: false,
                     result: receiver,
                 },
             );
@@ -510,13 +531,13 @@ async fn issue_ice(
     let configuration = credential_result(&mut result).await?;
     {
         let mut book = service.lock()?;
-        let grant = book.grants.get(&key).ok_or_else(missing)?;
+        let grant = book.grants.get(&key).ok_or_else(attempt_missing)?;
         if grant.revoked {
             return Err(ApiError(StatusCode::FORBIDDEN, "relay_credential_revoked"));
         }
         // A request delayed beyond setup lifetime cannot disclose new material.
         if !book.lease((ids.0, ids.1))?.attempts.contains_key(&ids.2) {
-            return Err(missing());
+            return Err(attempt_missing());
         }
     }
     let mut headers = HeaderMap::new();
@@ -551,6 +572,12 @@ async fn revoke_relay(
     let mut results = Vec::new();
     {
         let mut book = service.lock()?;
+        if let Some(lease) = book.leases.get_mut(&(ids.0, ids.1))
+            && lease.admin == digest
+            && let Some(attempt) = lease.attempts.get_mut(&ids.2)
+        {
+            attempt.relay_revoked = true;
+        }
         for host in [false, true] {
             if let Some(grant) = book.grants.get(&(ids.0, ids.1, ids.2, host))
                 && grant.digest != digest
@@ -568,6 +595,7 @@ async fn revoke_relay(
                 && (grant.digest == digest || grant.admin == digest)
             {
                 grant.revoked = true;
+                grant.revoke_all |= grant.admin == digest;
                 results.push(grant.result.clone());
             }
         }
@@ -597,7 +625,7 @@ async fn offer(
     let mut book = service.lock()?;
     let lease = book.lease((world, address))?;
     lease.locate(input.locator)?;
-    let attempt = lease.attempts.get_mut(&id).ok_or_else(missing)?;
+    let attempt = lease.attempts.get_mut(&id).ok_or_else(attempt_missing)?;
     attempt.access(&digest)?;
     if attempt.peer_id != input.peer_id || attempt.begin.proof != input.proof {
         return Err(ApiError(StatusCode::CONFLICT, "setup_conflict"));
@@ -623,7 +651,7 @@ async fn read(
         .lease((world, address))?
         .attempts
         .get_mut(&id)
-        .ok_or_else(missing)?;
+        .ok_or_else(attempt_missing)?;
     attempt.access(&digest)?;
     Ok(Json(attempt.reply(id)))
 }
@@ -639,7 +667,7 @@ async fn answer(
     let lease = book.lease((world, address))?;
     lease.authorize(&digest)?;
     lease.locate(input.locator)?;
-    let attempt = lease.attempts.get_mut(&id).ok_or_else(missing)?;
+    let attempt = lease.attempts.get_mut(&id).ok_or_else(attempt_missing)?;
     if let Some(answer) = &mut attempt.answer {
         if answer.sdp != input.sdp {
             return Err(ApiError(StatusCode::CONFLICT, "setup_conflict"));

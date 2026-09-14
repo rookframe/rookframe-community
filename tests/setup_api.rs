@@ -129,6 +129,52 @@ async fn revocation_refuses_reissuance_without_claiming_coturn_provider_revocati
     let (status, error) = request(&app, "POST", &connection, begin, Some(CLIENT)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error["error"], "relay_credential_revoked");
+
+    // Revocation covers the authority side even before it requests a grant.
+    let next = format!("{path}/connections/{}", Uuid::new_v4());
+    reserve(
+        &app,
+        &next,
+        &json!({"locator":locator,"peer_id":43,"proof":CLIENT}),
+    )
+    .await;
+    request(
+        &app,
+        "DELETE",
+        &format!("{next}/relay"),
+        Value::Null,
+        Some(ADMIN),
+    )
+    .await;
+    let (status, error) = request(
+        &app,
+        "POST",
+        &format!("{next}/ice"),
+        json!({"locator":locator}),
+        Some(ADMIN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], "relay_credential_revoked");
+    // Deleting signaling cannot turn the same revoked identity into a fresh grant.
+    request(&app, "DELETE", &next, Value::Null, Some(CLIENT)).await;
+    let begin = json!({"locator":locator,"peer_id":43,"proof":CLIENT});
+    assert_eq!(
+        request(&app, "POST", &next, begin, Some(CLIENT)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("{next}/ice"),
+            json!({"locator":locator}),
+            Some(ADMIN)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
 }
 
 async fn reserve(app: &Router, path: &str, offer: &Value) {
