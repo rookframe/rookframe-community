@@ -8,7 +8,8 @@ The service neither stores Worlds nor authenticates Participants.
 
 `GET /health` checks PostgreSQL, migration readiness and configured TURN issuance
 state (503 after an observed issuance failure until a successful issuance). It
-does not probe the provider or prove that allocations work. `GET /metrics` exposes
+does not probe the provider or prove that allocations work. `GET /metrics`
+(at the origin root, outside the API prefix) exposes
 aggregate issuance/revocation counters, with no credential or principal labels.
 `GET /live` checks the
 process. `GET /worlds?q=words&offset=0&limit=30` returns `listings` and optional

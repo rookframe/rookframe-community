@@ -23,7 +23,7 @@ curl --fail http://127.0.0.1:8080/api/v1/live
 The default listener is loopback. Set `LISTEN_ADDR` explicitly inside a trusted
 private reverse-proxy network. Do not expose PostgreSQL or plaintext app traffic.
 The lockfile pins Rust dependencies; OpenTofu has its own committed provider lock.
-TURN is disabled until configured; `/health` returns 503 in that state. Choose
+TURN is disabled until configured; `/api/v1/health` returns 503 in that state. Choose
 Cloudflare or independent coturn using the private configuration described in
 [operations](docs/operations.md#turn-provider-configuration).
 

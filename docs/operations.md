@@ -131,7 +131,7 @@ result; a failed issuance needs a new bounded attempt. Issuance is capped at fou
 provider calls concurrently, 64 grants/minute globally, 128 retained grants per
 World and 1024 globally, all retained until expiry. Use provider bandwidth and
 allocation quotas plus monitoring to bound spend; issuance limits alone do not
-cap bytes. Review aggregate `/api/v1/metrics` counters and opaque-principal
+cap bytes. Review aggregate `/metrics` counters and opaque-principal
 issuance outcomes. Never enable HTTP body/header tracing. Principals are technical
 attribution, not verified human identity; no account system is introduced.
 
