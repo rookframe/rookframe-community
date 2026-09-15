@@ -26,6 +26,7 @@ services:
     environment:
       DATABASE_URL: {{ ('postgres://community:' + database_password + '@db/community') | to_json }}
       LISTEN_ADDR: '0.0.0.0:8080'
+      TRUST_PROXY: 'true'
       TURN_PROVIDER: {{ turn_provider | to_json }}
       TURN_TTL_SECONDS: {{ (turn_ttl_seconds | default(21600) | string) | to_json }}
 {% if turn_provider == 'cloudflare' %}

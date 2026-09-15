@@ -163,3 +163,44 @@ visibility on the final claim, then asynchronously retries this projection every
 ten seconds. A failed service update does not undo the Seat or block preparation.
 The service receives counts only: no Invitation secrets, installation keys, Seat
 credentials, Player names, World saves or Package archives.
+
+
+## Private Join Requests
+
+`/api/v1/worlds/{world}/{address}/requests/{request}` supports applicant `PUT`
+(submit `{name,message}`) and `GET` (status). `/withdraw` accepts applicant `POST`.
+The applicant generates one UUID v4 per logical request and retains a 64-character
+hex bearer proof before sending. Repeating the same ID and body recovers the same
+submission. Names are required (1–100 UTF-16 units); private messages are required
+(1–4,000). Duplicate names are allowed. A World/installation can hold only one
+pending or accepted request. Pending requests reserve no capacity.
+
+The World administrator bearer can `GET .../requests` (at most 200 records,
+pending first), and `PUT .../{request}/decision` with a UUID `decision_id` and
+`action`: `prepare`, `abort`, `accept`, or `reject`. Rejection accepts an optional
+private `response` (1–4,000). Acceptance requires the receipt authored by the World
+(`seat_id`, exact `name`, `credential`); the Seat ID equals the request ID.
+
+Manager journals the acceptance intent privately, prepares the service decision,
+commits the Seat through stopped World administration or the running Authority,
+then acknowledges that exact receipt and synchronizes capacity. Prepare fences
+withdrawal and other decisions. A known pre-commit failure aborts preparation;
+a lost reply or uncertain World outcome retains the journal for reconciliation.
+The service never authors a Player identity or reserves a Seat. Retries of a
+completed decision return the same outcome. Applicants alone receive credentials;
+GM review receives an installation hash, never the applicant's bearer proof.
+
+Undecided requests expire after 30 days. Recruitment name/message text is scrubbed
+at that deadline, including interrupted decisions. A prepared decision awaiting
+its World outcome retains only reconciliation metadata until Manager resolves it;
+expiring it blindly could contradict an already committed Seat. Terminal status,
+response, and accepted receipt are removed 30 days after the terminal outcome.
+Maintenance runs every minute and before request reads/mutations. All request
+responses use `Cache-Control: no-store`; request bodies are not logged or public.
+
+Limits: 100 pending requests per listing; hourly submissions 10 per installation,
+100 per network address; status/withdrawal checks 600 per installation, 6,000 per
+network address. PostgreSQL counters and listing row locks enforce these limits
+under concurrency. Caddy overwrites `X-Rookframe-Client-IP`; only the private
+container listener with `TRUST_PROXY=true` trusts that header. Standalone servers
+use the TCP peer address.

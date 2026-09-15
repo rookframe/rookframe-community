@@ -1,7 +1,9 @@
 mod directory;
 mod error;
+mod requests;
 mod setup;
 mod turn;
+pub use requests::maintain as maintain_requests;
 pub use turn::TurnProvider;
 
 use axum::{
@@ -54,6 +56,7 @@ pub fn router_with_turn(db: PgPool, turn: TurnProvider) -> Router {
             axum::routing::put(directory::capacity),
         )
         .with_state(db.clone())
+        .merge(requests::router(db.clone()))
         .merge(setup::router(db, turn))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(

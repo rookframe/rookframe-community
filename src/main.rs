@@ -65,10 +65,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("community_server_ready");
     let turn = rookframe_community::TurnProvider::from_env()?;
-    axum::serve(listener, rookframe_community::router_with_turn(db, turn))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    tokio::spawn(rookframe_community::maintain_requests(db.clone()));
+    axum::serve(
+        listener,
+        rookframe_community::router_with_turn(db, turn)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
