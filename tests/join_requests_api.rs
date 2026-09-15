@@ -332,6 +332,16 @@ async fn concurrent_submissions_cannot_exceed_the_hundred_pending_limit(db: PgPo
             .unwrap(),
         100
     );
+    let (_, review) = request(
+        &app,
+        "GET",
+        &format!("{world}/requests"),
+        Value::Null,
+        ADMIN,
+    )
+    .await;
+    assert!(review.to_string().len() > 1024 * 1024);
+    assert_eq!(review["requests"].as_array().unwrap().len(), 100);
 }
 
 #[sqlx::test(migrations = "./migrations")]
