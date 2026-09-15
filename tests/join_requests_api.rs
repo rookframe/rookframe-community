@@ -296,7 +296,7 @@ async fn concurrent_submissions_cannot_exceed_the_hundred_pending_limit(db: PgPo
     let world_id = Uuid::parse_str(parts[2]).unwrap();
     let address = Uuid::parse_str(parts[3]).unwrap();
     for _ in 0..99 {
-        sqlx::query("INSERT INTO join_requests(request_id,world_id,world_address,installation_digest,submission_digest,name,message) VALUES($1,$2,$3,$4,$4,'Mira','Private')")
+        sqlx::query("INSERT INTO join_requests(request_id,world_id,world_address,installation_digest,submission_digest,name,message) VALUES($1,$2,$3,$4,$4,'Mira',repeat('界',4000))")
             .bind(Uuid::new_v4()).bind(world_id).bind(address).bind(Uuid::new_v4().as_bytes().to_vec()).execute(&db).await.unwrap();
     }
     let first = format!("{world}/requests/{}", Uuid::new_v4());
