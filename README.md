@@ -42,3 +42,8 @@ tofu -chdir=infra/terraform validate
 ```
 
 [API contract](docs/api.md) · [Local deployment and recovery](docs/operations.md)
+
+Player administration includes installation request blocks, idempotent removal
+cleanup and bounded abuse reports. The optional operator moderation capability
+is separate from World administration; see [API](docs/api.md#player-removal-installation-blocks-and-abuse-reports)
+and [operations](docs/operations.md#recruitment-moderation).

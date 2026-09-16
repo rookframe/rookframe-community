@@ -63,8 +63,7 @@ Losing it does not transfer ownership; recovering the token from a private backu
 is required. There is no password, Participant account, or public reset endpoint.
 Public GET never returns tokens, digests or operation history. Removal retains
 ownership and retry receipts so stale publication requests cannot resurrect data.
-Service moderation, retention cleanup, edits/check-in and lifecycle synchronization
-are later slices; operation receipts currently remain until operator-managed
+Directory publication operation receipts remain until operator-managed
 retention can be introduced with an explicit retry horizon.
 
 ## Setup operations
@@ -163,3 +162,28 @@ admission revision, defaulting existing addresses to zero. Deployment backs up
 PostgreSQL before applying it. The health probe references these columns, so an
 unmigrated deployment cannot report readiness. Automatic Private cleanup keeps
 address ownership and operation receipts. It never republishes a World.
+
+## Recruitment moderation
+
+Migration `0004_recruitment_controls.sql` adds bounded private installation blocks,
+removed-request state, removal receipts and expiring abuse reports. The ordinary
+deploy backup runs before migrations; no local World data is stored or changed.
+
+Generate a separate random 32-byte hex operator token and store it in an
+operator-only secret file (mode 0600). Put its SHA-256 hex digest into the private
+Ansible configuration as `moderation_token_sha256`. Only the digest enters the
+service environment. Missing/empty configuration disables operator access.
+Never reuse a World administrator token, host lease, applicant proof or TURN key.
+
+Use this bearer over HTTPS to read `/api/v1/operator/reports` (oldest 100
+unresolved, within 30 days), then PUT `{ "hidden": true }` to
+`/api/v1/operator/worlds/{world}/{address}`. Restoring uses `false`. Review and
+actions are explicitly operator initiated; reports do not impose automatic
+sanctions. The route changes Directory visibility and new Join Request intake
+only; World access and data remain under the GM's World Authority.
+
+The operator receives submitted reasons and target IDs, not applicant proofs,
+private recruitment messages, response text or accepted World credentials. Do
+not paste report contents into public logs or tickets. Inspect redacted aggregate
+service health only. Minute maintenance removes reports and removal receipts
+after 30 days and keeps the pre-existing request retention rules.

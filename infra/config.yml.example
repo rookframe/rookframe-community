@@ -9,3 +9,8 @@ cloudflare_turn_api_token: REPLACE_WITH_BACKEND_ONLY_TURN_TOKEN
 # No Cloudflare account or credentials are used in coturn mode.
 # coturn_urls: 'stun:relay.example.com:3478,turn:relay.example.com:3478?transport=udp'
 # coturn_shared_secret: REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES
+
+# Optional operator-only capability: SHA-256 of a separately generated 64-hex token.
+# Keep the raw token offline; never reuse World administration or TURN credentials.
+# Without this setting, operator moderation routes deny every request.
+# moderation_token_sha256: REPLACE_WITH_SHA256_OF_OPERATOR_TOKEN

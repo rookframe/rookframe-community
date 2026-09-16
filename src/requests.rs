@@ -50,7 +50,7 @@ pub struct Submission {
     message: String,
 }
 
-fn identity(headers: &HeaderMap) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn identity(headers: &HeaderMap) -> Result<Vec<u8>, ApiError> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -59,13 +59,13 @@ fn identity(headers: &HeaderMap) -> Result<Vec<u8>, ApiError> {
         .ok_or(ApiError(StatusCode::UNAUTHORIZED, "credential_required"))?;
     Ok(Sha256::digest(token.as_bytes()).to_vec())
 }
-fn secret(value: &str) -> bool {
+pub(crate) fn secret(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
 }
-fn valid_text(value: &str, maximum: usize, multiline: bool) -> bool {
+pub(crate) fn valid_text(value: &str, maximum: usize, multiline: bool) -> bool {
     !value.is_empty()
         && value.trim() == value
         && value.encode_utf16().count() <= maximum
@@ -73,10 +73,10 @@ fn valid_text(value: &str, maximum: usize, multiline: bool) -> bool {
             .chars()
             .any(|c| c.is_control() && !(multiline && matches!(c, '\n' | '\r')))
 }
-fn valid_id(id: Uuid) -> bool {
+pub(crate) fn valid_id(id: Uuid) -> bool {
     id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122
 }
-async fn lock_world(
+pub(crate) async fn lock_world(
     tx: &mut Transaction<'_, Postgres>,
     (world, address): Target,
 ) -> Result<PgRow, ApiError> {
@@ -87,7 +87,7 @@ async fn lock_world(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "listing_not_found"))
 }
-fn administrator(row: &PgRow, digest: &[u8]) -> Result<(), ApiError> {
+pub(crate) fn administrator(row: &PgRow, digest: &[u8]) -> Result<(), ApiError> {
     if row.get::<Vec<u8>, _>("administrator_digest") != digest {
         return Err(ApiError(StatusCode::FORBIDDEN, "administrator_mismatch"));
     }
@@ -107,10 +107,16 @@ pub async fn cleanup(db: &PgPool) -> Result<(), ApiError> {
     sqlx::query("DELETE FROM request_rate_limits WHERE bucket<now()-interval '2 hours'")
         .execute(db)
         .await?;
+    sqlx::query("DELETE FROM abuse_reports WHERE created_at<=now()-interval '30 days'")
+        .execute(db)
+        .await?;
+    sqlx::query("DELETE FROM player_removals WHERE created_at<=now()-interval '30 days'")
+        .execute(db)
+        .await?;
     Ok(())
 }
 
-async fn rate(
+pub(crate) async fn rate(
     db: &PgPool,
     digest: &[u8],
     network: Option<SocketAddr>,
@@ -160,7 +166,7 @@ fn view(row: &PgRow, gm: bool) -> Value {
         "status":row.get::<String,_>("status"),"response":row.get::<Option<String>,_>("response"),
         "created_at":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
         "expires_at":row.get::<chrono::DateTime<chrono::Utc>,_>("expires_at"),
-        "decision_id":row.get::<Option<Uuid>,_>("decision_id")});
+        "decision_id":row.get::<Option<Uuid>,_>("decision_id"), "removed":row.get::<bool,_>("removed"), "blocked":row.get::<bool,_>("blocked")});
     if gm {
         value["installation_hash"] =
             json!(hex::encode(row.get::<Vec<u8>, _>("installation_digest")));
@@ -209,13 +215,25 @@ pub async fn submit(
         }
         return Ok(Json(view(&row, false)));
     }
-    if listing.get::<Option<Value>, _>("listing").is_none()
+    if listing.get::<bool, _>("moderated")
+        || listing.get::<Option<Value>, _>("listing").is_none()
         || listing.get::<chrono::DateTime<chrono::Utc>, _>("checked_in_at")
             <= chrono::Utc::now() - chrono::Duration::days(30)
     {
         return Err(ApiError(StatusCode::NOT_FOUND, "listing_not_found"));
     }
-    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM join_requests WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3 AND status IN ('pending','accepted'))")
+    let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM installation_blocks WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3)")
+        .bind(world).bind(address).bind(&digest).fetch_one(&mut *tx).await?;
+    if blocked {
+        return Err(ApiError(StatusCode::FORBIDDEN, "installation_blocked"));
+    }
+    let listing_details: Value = listing.get("listing");
+    if listing.get::<i32, _>("reserved_seats") as i64
+        >= listing_details["player_limit"].as_i64().unwrap_or(0)
+    {
+        return Err(ApiError(StatusCode::CONFLICT, "world_full"));
+    }
+    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM join_requests WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3 AND status IN ('pending','accepted') AND NOT removed)")
         .bind(world).bind(address).bind(&digest).fetch_one(&mut *tx).await?;
     if active {
         return Err(ApiError(StatusCode::CONFLICT, "active_request_exists"));
@@ -322,21 +340,23 @@ pub struct Receipt {
 pub async fn decide(
     State(db): State<PgPool>,
     Path(target): Path<RequestTarget>,
+    network: ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Decision>,
 ) -> Result<Json<Value>, ApiError> {
     let digest = identity(&headers)?;
+    rate(&db, &digest, Some(network.0), &headers, false).await?;
     if !valid_id(body.decision_id)
         || !matches!(
             body.action.as_str(),
-            "prepare" | "abort" | "accept" | "reject"
+            "prepare" | "abort" | "accept" | "reject" | "reject-block"
         )
         || body
             .response
             .as_ref()
             .is_some_and(|s| !valid_text(s, 4000, true))
         || (body.action == "accept") != body.receipt.is_some()
-        || body.action != "reject" && body.response.is_some()
+        || !matches!(body.action.as_str(), "reject" | "reject-block") && body.response.is_some()
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_decision"));
     }
@@ -369,7 +389,8 @@ pub async fn decide(
                 && body.action == "accept"
                 && row.get::<Option<Value>, _>("receipt") == receipt)
                 || (status == "rejected"
-                    && body.action == "reject"
+                    && matches!(body.action.as_str(), "reject" | "reject-block")
+                    && row.get::<bool, _>("blocked") == (body.action == "reject-block")
                     && row.get::<Option<String>, _>("response") == body.response))
         {
             return Ok(Json(view(&row, true)));
@@ -405,14 +426,25 @@ pub async fn decide(
             sqlx::query("UPDATE join_requests SET status='accepted',terminal_at=now(),receipt=$2,message=NULL WHERE request_id=$1")
                 .bind(target.2).bind(receipt).execute(&mut *tx).await?;
         }
-        "reject" => {
+        "reject" | "reject-block" => {
             if previous.is_some() {
                 return Err(ApiError(StatusCode::CONFLICT, "decision_in_progress"));
             }
-            sqlx::query("UPDATE join_requests SET status='rejected',terminal_at=now(),decision_id=$2,response=$3 WHERE request_id=$1")
-                .bind(target.2).bind(body.decision_id).bind(body.response).execute(&mut *tx).await?;
+            sqlx::query("UPDATE join_requests SET status='rejected',terminal_at=now(),decision_id=$2,response=$3,blocked=$4 WHERE request_id=$1")
+                .bind(target.2).bind(body.decision_id).bind(body.response).bind(body.action == "reject-block").execute(&mut *tx).await?;
         }
         _ => unreachable!(),
+    }
+    if body.action == "reject-block" {
+        crate::moderation::block(
+            &mut tx,
+            (target.0, target.1),
+            &row.get::<Vec<u8>, _>("installation_digest"),
+            row.get::<Option<String>, _>("name")
+                .as_deref()
+                .unwrap_or("Rejected applicant"),
+        )
+        .await?;
     }
     let result = locked_request(&mut tx, target).await?;
     tx.commit().await?;

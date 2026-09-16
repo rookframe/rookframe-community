@@ -171,7 +171,7 @@ pub async fn read(
     State(db): State<PgPool>,
     Path((world, address)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
-    let row = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days'")
+    let row = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND NOT moderated AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days'")
         .bind(world).bind(address).fetch_optional(&db).await?.ok_or(ApiError(StatusCode::NOT_FOUND,"listing_not_found"))?;
     Ok(Json(entry(row)))
 }
@@ -194,7 +194,7 @@ pub async fn browse(
             .replace('%', "\\%")
             .replace('_', "\\_")
     );
-    let rows = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE listing IS NOT NULL AND checked_in_at > now()-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language') ILIKE $1 ORDER BY (reserved_seats >= (listing->>'player_limit')::int),checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
+    let rows = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE NOT moderated AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language') ILIKE $1 ORDER BY (reserved_seats >= (listing->>'player_limit')::int),checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
         .bind(pattern).bind(limit+1).bind(search.offset).fetch_all(&db).await?;
     let next = if rows.len() > limit as usize {
         Some(search.offset + limit)

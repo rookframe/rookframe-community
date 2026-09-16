@@ -1,5 +1,6 @@
 mod directory;
 mod error;
+mod moderation;
 mod requests;
 mod setup;
 mod turn;
@@ -19,6 +20,14 @@ pub fn router(db: PgPool) -> Router {
 }
 
 pub fn router_with_turn(db: PgPool, turn: TurnProvider) -> Router {
+    let operator = std::env::var("MODERATION_TOKEN_SHA256")
+        .ok()
+        .filter(|s| requests::secret(s))
+        .and_then(|s| hex::decode(s).ok());
+    router_with_moderation(db, turn, operator)
+}
+
+pub fn router_with_moderation(db: PgPool, turn: TurnProvider, operator: Option<Vec<u8>>) -> Router {
     let health_turn = turn.clone();
     let metrics_turn = turn.clone();
     Router::new()
@@ -57,6 +66,7 @@ pub fn router_with_turn(db: PgPool, turn: TurnProvider) -> Router {
         )
         .with_state(db.clone())
         .merge(requests::router(db.clone()))
+        .merge(moderation::router(db.clone(), operator))
         .merge(setup::router(db, turn))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(

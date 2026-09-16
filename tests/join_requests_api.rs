@@ -474,3 +474,224 @@ async fn interrupted_decision_scrubs_recruitment_text_at_thirty_days_and_recover
         receipt
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rejection_block_is_private_and_explicitly_reversible(db: PgPool) {
+    let app = rookframe_community::router(db);
+    let world = published(&app).await;
+    let id = Uuid::new_v4();
+    let path = format!("{world}/requests/{id}");
+    let body = json!({"name":"Mira","message":"Private application"});
+    assert_eq!(
+        request(&app, "PUT", &path, body.clone(), APPLICANT).await.0,
+        StatusCode::OK
+    );
+    let decision =
+        json!({"decision_id":Uuid::new_v4(),"action":"reject-block","response":"No thanks"});
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &format!("{path}/decision"),
+            decision.clone(),
+            ADMIN
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "PUT", &format!("{path}/decision"), decision, ADMIN)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let next = format!("{world}/requests/{}", Uuid::new_v4());
+    assert_eq!(
+        request(&app, "PUT", &next, body.clone(), APPLICANT).await.1["error"],
+        "installation_blocked"
+    );
+    assert_eq!(
+        request(&app, "GET", &format!("{world}/blocks"), Value::Null, OTHER)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let blocks = request(&app, "GET", &format!("{world}/blocks"), Value::Null, ADMIN)
+        .await
+        .1;
+    let hash = blocks["blocks"][0]["installation_hash"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("{world}/blocks/{hash}"),
+            Value::Null,
+            ADMIN
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "PUT", &next, body, APPLICANT).await.0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn removal_scrubs_receipts_allows_reapplication_and_retry_cannot_restore_a_block(db: PgPool) {
+    use sha2::{Digest, Sha256};
+    let app = rookframe_community::router(db);
+    let world = published(&app).await;
+    let id = Uuid::new_v4();
+    let path = format!("{world}/requests/{id}");
+    let body = json!({"name":"Mira","message":"Private"});
+    assert_eq!(
+        request(&app, "PUT", &path, body.clone(), APPLICANT).await.0,
+        StatusCode::OK
+    );
+    let operation = Uuid::new_v4();
+    let decision = format!("{path}/decision");
+    request(
+        &app,
+        "PUT",
+        &decision,
+        json!({"decision_id":operation,"action":"prepare"}),
+        ADMIN,
+    )
+    .await;
+    request(&app,"PUT",&decision,json!({"decision_id":operation,"action":"accept","receipt":{"seat_id":id,"name":"Mira","credential":OTHER}}),ADMIN).await;
+    let hash = hex::encode(Sha256::digest(APPLICANT.as_bytes()));
+    let removal = json!({"operation_id":Uuid::new_v4(),"installation_hashes":[hash],"name":"Mira","block":true});
+    let endpoint = format!("{world}/players/{id}/removal");
+    assert_eq!(
+        request(&app, "PUT", &endpoint, removal.clone(), OTHER)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "PUT", &endpoint, removal.clone(), ADMIN)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let result = request(&app, "GET", &path, Value::Null, APPLICANT).await.1;
+    assert_eq!(result["removed"], true);
+    assert!(result["receipt"].is_null());
+    assert!(!result.to_string().contains(OTHER));
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("{world}/blocks/{hash}"),
+            Value::Null,
+            ADMIN
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "PUT", &endpoint, removal, ADMIN).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &format!("{world}/requests/{}", Uuid::new_v4()),
+            body,
+            APPLICANT
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reports_are_bounded_private_and_only_an_operator_can_hide_service_presence(db: PgPool) {
+    use sha2::{Digest, Sha256};
+    let app = rookframe_community::router_with_moderation(
+        db.clone(),
+        rookframe_community::TurnProvider::disabled(),
+        Some(Sha256::digest(OTHER.as_bytes()).to_vec()),
+    );
+    let world = published(&app).await;
+    let id = Uuid::new_v4();
+    let report = format!("{world}/reports/{id}");
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &report,
+            json!({"reason":"Abusive listing"}),
+            APPLICANT
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", "/operator/reports", Value::Null, ADMIN)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let reports = request(&app, "GET", "/operator/reports", Value::Null, OTHER)
+        .await
+        .1;
+    assert_eq!(reports["reports"].as_array().unwrap().len(), 1);
+    assert!(!reports.to_string().contains("reporter_digest"));
+    let moderation = format!("/operator{world}");
+    assert_eq!(
+        request(&app, "PUT", &moderation, json!({"hidden":true}), ADMIN)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "PUT", &moderation, json!({"hidden":true}), OTHER)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &world, Value::Null, APPLICANT).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &moderation, json!({"hidden":false}), OTHER)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &world, Value::Null, APPLICANT).await.0,
+        StatusCode::OK
+    );
+    let long = json!({"reason":"x".repeat(1001)});
+    assert_eq!(
+        request(&app, "PUT", &report, long, APPLICANT).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    sqlx::query("UPDATE abuse_reports SET created_at=now()-interval '31 days'")
+        .execute(&db)
+        .await
+        .unwrap();
+    request(
+        &app,
+        "PUT",
+        &format!("{world}/requests/{}", Uuid::new_v4()),
+        json!({"name":"Mira","message":"Private"}),
+        APPLICANT,
+    )
+    .await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM abuse_reports")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}

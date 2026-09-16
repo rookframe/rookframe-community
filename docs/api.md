@@ -173,11 +173,11 @@ The applicant generates one UUID v4 per logical request and retains a 64-charact
 hex bearer proof before sending. Repeating the same ID and body recovers the same
 submission. Names are required (1–100 UTF-16 units); private messages are required
 (1–4,000). Duplicate names are allowed. A World/installation can hold only one
-pending or accepted request. Pending requests reserve no capacity.
+pending or accepted, non-removed request. Pending requests reserve no capacity.
 
 The World administrator bearer can `GET .../requests` (at most 200 records,
 pending first), and `PUT .../{request}/decision` with a UUID `decision_id` and
-`action`: `prepare`, `abort`, `accept`, or `reject`. Rejection accepts an optional
+`action`: `prepare`, `abort`, `accept`, `reject`, or `reject-block`. Rejection accepts an optional
 private `response` (1–4,000). Acceptance requires the receipt authored by the World
 (`seat_id`, exact `name`, `credential`); the Seat ID equals the request ID.
 
@@ -204,3 +204,46 @@ network address. PostgreSQL counters and listing row locks enforce these limits
 under concurrency. Caddy overwrites `X-Rookframe-Client-IP`; only the private
 container listener with `TRUST_PROXY=true` trusts that header. Standalone servers
 use the TCP peer address.
+
+## Player removal, installation blocks and abuse reports
+
+All paths below start with `/api/v1`. They use the existing bearer authorization,
+strict body bounds and `Cache-Control: no-store`. Bodies and headers must never
+be logged. A World administration capability is not a gameplay credential.
+
+- `GET /worlds/{world}/{address}/blocks` requires that World's administrator. It
+  returns at most 1,000 private `{installation_hash,name,created_at}` records.
+  `DELETE .../blocks/{installation_hash}` unblocks new requests idempotently.
+- `reject-block` atomically rejects a pending request and blocks its installation.
+  Ordinary `reject` never creates a block. Rejection retries must use the same
+  decision ID, response and block choice. Accountless blocks can be evaded by a
+  new installation. Existing accepted Players must be removed separately.
+- `PUT /worlds/{world}/{address}/players/{seat}/removal` requires administration
+  and `{operation_id,installation_hashes,name,block}`. Manager has already removed
+  the Seat and revoked all Sessions durably. Up to 33 installation hashes can be
+  blocked. The service scrubs that Seat's accepted receipt and marks its request
+  `removed:true`; it never mutates a World. Removed/rejected applicants may submit
+  a new request unless blocked. An exact removal retry does not recreate a block
+  that was subsequently lifted. Manager retains its private recovery journal
+  until cleanup and capacity projection are confirmed.
+- `PUT /worlds/{world}/{address}/reports/{report}` accepts a stable UUID and
+  `{request_id:null,reason}` for a currently public listing. A request report uses
+  its request UUID and requires World administration. Reason is required,
+  1–1,000 UTF-16 units. A retry must match the original target, author and body.
+  Private recruitment messages and World credentials are not copied into reports.
+- `GET /operator/reports` returns the oldest 100 unresolved reports.
+  `PUT /operator/worlds/{world}/{address}` with `{hidden:true}` hides discovery and
+  new requests; `{hidden:false}` restores eligibility. Both require the separate
+  operator bearer configured by `MODERATION_TOKEN_SHA256`. GM credentials cannot
+  call them. The action resolves this address's reports and changes only service
+  presence. It cannot delete or modify a local World, its Actors or Sessions.
+
+Reports and removal-operation receipts expire after 30 days. Installation blocks
+remain until explicitly removed, bounded at 1,000 per World Address. Existing
+Join Request response/text retention remains unchanged. Removal deletes the
+accepted credential immediately without deleting the private response early.
+Submission limits (10/installation/hour, 100/network/hour) cover reports and
+unblocking. Read/decision/removal/operator limits are 600/installation/hour and
+6,000/network/hour; these share the request counters and cannot evade them by
+switching endpoints. New requests also reject `world_full` or
+`installation_blocked` without reserving a Seat.
