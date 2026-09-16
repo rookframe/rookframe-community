@@ -21,6 +21,16 @@ modify the Package Catalogue or other existing servers.
    volume, starts PostgreSQL, dumps a pre-migration backup, runs explicit
    migrations, and starts the app and Caddy with valid public HTTPS.
 
+Keep the repository checkout, OpenTofu state and private configuration together
+on the operator's machine. The deployment script reads the existing OpenTofu
+outputs; it does not provision infrastructure or alter DNS. A new operator also
+needs OpenTofu, Ansible, SSH, rsync, the selected provider credentials, and the
+verified SSH host key. `infra/.local/`, `dist/`, Terraform state, plans and real
+tfvars are ignored. Run `python3 scripts/check-publication.py` before publishing:
+it checks all reachable committed history for private file paths and known
+credential values from the environment and private configuration. This check
+cannot identify an unknown credential merely from its contents.
+
 Production directory: `/opt/rookframe-community`. The app is unprivileged,
 read-only, capability-free, and memory/process limited. Database and app ports
 are private to Compose. Public bodies are limited to 32 KiB, responses/pages
@@ -50,11 +60,98 @@ old volume until accepted. Both address ownership and operation records are
 required for correct retries. They contain capability digests and private
 historical metadata; protect backups accordingly.
 
+Also verify `join_requests`, `installation_blocks`, `player_removals`,
+`abuse_reports` and `_sqlx_migrations`; a successful SQL import alone is not a
+restore acceptance. Compare row counts and complete business data with the
+backup-time snapshot, using UTC for timestamp serialization. Running authorities
+refresh `world_addresses.checked_in_at`, so compare that lease timestamp
+separately from durable listing/ownership/capacity data. Use the restored service
+on loopback to verify a public listing and authenticated request recovery with
+the original privately retained proof. Never print accepted receipts, proofs or
+private messages. Do not point the public proxy at the restore-check database.
+After acceptance, stop its local process and drop only that disposable database;
+retain the protected backup under the operator's retention policy.
+
 Update by deploying another clean commit with the same private state/config.
 The source is unpacked into `releases/<commit>` so deleted files cannot survive
 updates. Roll back source only if compatible with the current schema, otherwise
 restore a verified backup into a separate database. `prevent_destroy` protects
 the data volume from routine plans; no destructive teardown is automated.
+
+### Update and source rollback
+
+Use a maintenance window for setup interruption. Before updating, record the
+running source revision from the deployment record, download `/source.tar.gz`
+and hash it, and record the application image ID and binary hash without dumping
+its environment:
+
+```sh
+# On the Community host:
+docker inspect rookframe-community-app-1 --format '{{.Image}}'
+docker exec rookframe-community-app-1 sha256sum /app/community
+```
+
+On the operator's machine, from this repository:
+
+```sh
+git status --short
+git rev-parse HEAD
+python3 scripts/check-publication.py
+tofu -chdir=infra/terraform validate
+./scripts/backup.sh
+# Select the reviewed release in a clean checkout, then:
+./scripts/deploy.sh
+```
+
+Record the actual deployed commit, source archive hash, image ID and binary hash
+after each successful deployment. Check public HTTPS `/api/v1/health`, public
+Directory reads and a retained authenticated Join Request; compare durable
+records with the pre-update snapshot. Check the separately operated Package
+Catalogue's health too. Do not publish Compose configuration, `docker inspect`
+without a field filter, database dumps, or private API bodies as diagnostics.
+
+For a source rollback, first compare both releases' `migrations/` and the applied
+`_sqlx_migrations` versions/checksums. Confirm the previous application supports
+the current schema and any data written since the update. With identical schema
+and compatible data, use the same operator checkout/state/configuration:
+
+```sh
+git switch --detach <previous-full-commit>
+./scripts/deploy.sh
+```
+
+Repeat the health, source, binary and durable-state checks. To return to the
+accepted release, `git switch --detach <accepted-full-commit>` and deploy again;
+return the checkout to its original branch afterward. Keep the private state and
+configuration in place throughout. Never copy another deployment's state.
+
+This is a source rebuild, not an immutable-image rollback: the Docker base tags
+can change even though Cargo.lock and source are fixed. Compare the resulting
+artifact identity and retain prior images if byte-identical recovery is required.
+An incompatible schema must not be rolled back this way. Stop writes and use the
+fresh-database restore procedure above, with an explicit operator decision about
+post-backup writes; SQLx has no automatic down-migration here. Do not restore over
+the live database or run `docker compose down -v` as a recovery shortcut.
+
+### Restart without deployment
+
+```sh
+# On the Community host:
+cd /opt/rookframe-community
+docker compose -f compose.production.yml restart app
+docker compose -f compose.production.yml exec -T app /app/community healthcheck
+```
+
+The health command can fail while the process starts; retry after startup and
+then check the public HTTPS health endpoint. Restart PostgreSQL separately only
+when necessary; its data stays on the mounted volume. A stopped or unmounted
+volume is a deployment failure, never a reason to initialize a replacement.
+Directory listings, address ownership, Join Requests and decision/removal
+receipts survive app restart. Setup locators, pending negotiation and TURN
+issuance metrics are process-local and reset. Hosts publish fresh locators and
+interrupted applicants explicitly retry; established gameplay does not depend
+on the service process. A green readiness response confirms database/schema and
+configured/last-observed TURN issuance, not a fresh TURN connectivity test.
 
 ## Runtime capability storage
 
