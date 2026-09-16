@@ -247,3 +247,9 @@ unblocking. Read/decision/removal/operator limits are 600/installation/hour and
 6,000/network/hour; these share the request counters and cannot evade them by
 switching endpoints. New requests also reject `world_full` or
 `installation_blocked` without reserving a Seat.
+
+For an absent request, authenticated `GET /worlds/{world}/{address}/requests/{id}`
+returns `installation_blocked` when that same installation is blocked for the
+World Address. Existing retained requests remain readable. This lets a client
+recover the block without a submission attempt when its write quota is exhausted.
+The ordinary private-read installation/network limits still apply.

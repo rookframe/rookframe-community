@@ -477,7 +477,8 @@ async fn interrupted_decision_scrubs_recruitment_text_at_thirty_days_and_recover
 
 #[sqlx::test(migrations = "./migrations")]
 async fn rejection_block_is_private_and_explicitly_reversible(db: PgPool) {
-    let app = rookframe_community::router(db);
+    use sha2::{Digest, Sha256};
+    let app = rookframe_community::router(db.clone());
     let world = published(&app).await;
     let id = Uuid::new_v4();
     let path = format!("{world}/requests/{id}");
@@ -517,6 +518,19 @@ async fn rejection_block_is_private_and_explicitly_reversible(db: PgPool) {
             .0,
         StatusCode::FORBIDDEN
     );
+    // A blocked applicant must be able to learn the refusal without spending
+    // another submission attempt. Read throttling and other identities stay private.
+    sqlx::query("INSERT INTO request_rate_limits(scope,identity_digest,bucket,hits) VALUES('submit_installation',$1,date_trunc('hour',now()),10) ON CONFLICT(scope,identity_digest,bucket) DO UPDATE SET hits=10")
+        .bind(Sha256::digest(APPLICANT.as_bytes()).to_vec())
+        .execute(&db).await.unwrap();
+    assert_eq!(request(&app, "GET", &next, Value::Null, APPLICANT).await.1["error"], "installation_blocked");
+    assert_eq!(request(&app, "GET", &next, Value::Null, OTHER).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(request(&app, "PUT", &next, body.clone(), APPLICANT).await.0, StatusCode::TOO_MANY_REQUESTS);
+    sqlx::query("UPDATE request_rate_limits SET hits=600 WHERE scope='check_installation' AND identity_digest=$1")
+        .bind(Sha256::digest(APPLICANT.as_bytes()).to_vec())
+        .execute(&db).await.unwrap();
+    assert_eq!(request(&app, "GET", &next, Value::Null, APPLICANT).await.0, StatusCode::TOO_MANY_REQUESTS);
+    sqlx::query("DELETE FROM request_rate_limits").execute(&db).await.unwrap();
     let blocks = request(&app, "GET", &format!("{world}/blocks"), Value::Null, ADMIN)
         .await
         .1;

@@ -262,9 +262,18 @@ pub async fn read(
     rate(&db, &digest, Some(network.0), &headers, false).await?;
     cleanup(&db).await?;
     let row = sqlx::query("SELECT * FROM join_requests WHERE request_id=$1 AND world_id=$2 AND world_address=$3 AND installation_digest=$4")
-        .bind(id).bind(world).bind(address).bind(digest).fetch_optional(&db).await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND,"request_not_found"))?;
-    Ok(Json(view(&row, false)))
+        .bind(id).bind(world).bind(address).bind(&digest).fetch_optional(&db).await?;
+    if let Some(row) = row {
+        return Ok(Json(view(&row, false)));
+    }
+    // The private read budget still applies. Recover a known block without a
+    // write attempt, even when earlier submissions exhausted their own quota.
+    let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM installation_blocks WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3)")
+        .bind(world).bind(address).bind(digest).fetch_one(&db).await?;
+    Err(ApiError(
+        if blocked { StatusCode::FORBIDDEN } else { StatusCode::NOT_FOUND },
+        if blocked { "installation_blocked" } else { "request_not_found" },
+    ))
 }
 
 pub async fn review(
