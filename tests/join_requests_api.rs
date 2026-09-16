@@ -456,6 +456,7 @@ async fn interrupted_decision_scrubs_recruitment_text_at_thirty_days_and_recover
     .unwrap();
     let (_, result) = request(&app, "GET", &path, Value::Null, APPLICANT).await;
     assert!(result["name"].is_null() && result["message"].is_null());
+    assert_eq!(result["status"], "expired");
     let receipt = json!({"seat_id":id,"name":"Mira","credential":OTHER});
     assert_eq!(
         request(
@@ -523,14 +524,29 @@ async fn rejection_block_is_private_and_explicitly_reversible(db: PgPool) {
     sqlx::query("INSERT INTO request_rate_limits(scope,identity_digest,bucket,hits) VALUES('submit_installation',$1,date_trunc('hour',now()),10) ON CONFLICT(scope,identity_digest,bucket) DO UPDATE SET hits=10")
         .bind(Sha256::digest(APPLICANT.as_bytes()).to_vec())
         .execute(&db).await.unwrap();
-    assert_eq!(request(&app, "GET", &next, Value::Null, APPLICANT).await.1["error"], "installation_blocked");
-    assert_eq!(request(&app, "GET", &next, Value::Null, OTHER).await.0, StatusCode::NOT_FOUND);
-    assert_eq!(request(&app, "PUT", &next, body.clone(), APPLICANT).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        request(&app, "GET", &next, Value::Null, APPLICANT).await.1["error"],
+        "installation_blocked"
+    );
+    assert_eq!(
+        request(&app, "GET", &next, Value::Null, OTHER).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &next, body.clone(), APPLICANT).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
     sqlx::query("UPDATE request_rate_limits SET hits=600 WHERE scope='check_installation' AND identity_digest=$1")
         .bind(Sha256::digest(APPLICANT.as_bytes()).to_vec())
         .execute(&db).await.unwrap();
-    assert_eq!(request(&app, "GET", &next, Value::Null, APPLICANT).await.0, StatusCode::TOO_MANY_REQUESTS);
-    sqlx::query("DELETE FROM request_rate_limits").execute(&db).await.unwrap();
+    assert_eq!(
+        request(&app, "GET", &next, Value::Null, APPLICANT).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("DELETE FROM request_rate_limits")
+        .execute(&db)
+        .await
+        .unwrap();
     let blocks = request(&app, "GET", &format!("{world}/blocks"), Value::Null, ADMIN)
         .await
         .1;

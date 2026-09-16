@@ -329,3 +329,203 @@ async fn legacy_operation_replay_survives_capacity_upgrade(db: PgPool) {
     let replay = request(&app, "PUT", &path, change, Some(ADMIN)).await;
     assert_eq!(replay, original);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn search_includes_schedule_and_filters_each_listing_dimension(db: PgPool) {
+    let app = rookframe_community::router(db);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let mut data = listing();
+    data["schedule"] = json!("Friday 19:00 Europe/Berlin");
+    let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":data});
+    assert_eq!(
+        request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+        StatusCode::OK
+    );
+    for query in [
+        "q=Berlin",
+        "system=Basic%20Fantasy&language=English&online=false&full=false",
+    ] {
+        let (_, page) = request(&app, "GET", &format!("/worlds?{query}"), Value::Null, None).await;
+        assert_eq!(page["listings"].as_array().unwrap().len(), 1, "{query}");
+        assert_eq!(page["listings"][0]["online"], false);
+    }
+    for query in [
+        "system=Other",
+        "language=French",
+        "online=true",
+        "full=true",
+    ] {
+        let (_, page) = request(&app, "GET", &format!("/worlds?{query}"), Value::Null, None).await;
+        assert!(page["listings"].as_array().unwrap().is_empty(), "{query}");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn authenticated_lifecycle_orders_listings_and_revives_expired_addresses(db: PgPool) {
+    use chrono::{Duration, TimeZone, Utc};
+    use std::sync::{Arc, Mutex};
+    let start = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+    let clock = Arc::new(Mutex::new(start));
+    let now = clock.clone();
+    let app = rookframe_community::router_with_clock(db, Arc::new(move || *now.lock().unwrap()));
+    let world = Uuid::new_v4();
+    let online_address = Uuid::new_v4();
+    let offline_address = Uuid::new_v4();
+    let full_address = Uuid::new_v4();
+    for (index, address) in [online_address, offline_address, full_address]
+        .iter()
+        .enumerate()
+    {
+        *clock.lock().unwrap() = start + Duration::minutes(index as i64);
+        let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":listing(),"capacity":{"revision":1,"reserved":if index==2 {5} else {0},"claimed":0}});
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                &format!("/worlds/{world}/{address}"),
+                change,
+                Some(ADMIN)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let setup = format!("/setup/worlds/{world}/{online_address}");
+    let locator = Uuid::new_v4();
+    let live = json!({"locator":locator});
+    assert_eq!(
+        request(&app, "PUT", &setup, live.clone(), Some(ADMIN))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, page) = request(&app, "GET", "/worlds", Value::Null, None).await;
+    let addresses: Vec<_> = page["listings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["world_address"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addresses,
+        [
+            online_address.to_string(),
+            offline_address.to_string(),
+            full_address.to_string()
+        ]
+    );
+    assert_eq!(page["listings"][0]["online"], true);
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("{setup}?locator={locator}"),
+            Value::Null,
+            Some(ADMIN)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let path = format!("/worlds/{world}/{online_address}");
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.1["online"],
+        false
+    );
+    *clock.lock().unwrap() = start + Duration::days(30) + Duration::minutes(2);
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &setup, live.clone(), Some(&"b".repeat(64)))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &setup, live, Some(ADMIN)).await.0,
+        StatusCode::OK
+    );
+    let (_, revived) = request(&app, "GET", &path, Value::Null, None).await;
+    assert_eq!(revived["online"], true);
+    assert_eq!(revived["revision"], 1);
+    assert_eq!(revived["listing"], listing());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn expired_setup_lease_reports_offline_without_hiding_public_world(db: PgPool) {
+    let app = rookframe_community::router(db);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let change = json!({"operation_id":Uuid::new_v4(),"expected_revision":0,"listing":listing()});
+    assert_eq!(
+        request(&app, "PUT", &path, change, Some(ADMIN)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &format!("/setup{path}"),
+            json!({"locator":Uuid::new_v4()}),
+            Some(ADMIN)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let (status, entry) = request(&app, "GET", &path, Value::Null, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(entry["online"], false);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn destination_revision_requires_ownership_even_after_listing_removal(db: PgPool) {
+    let app = rookframe_community::router(db);
+    let path = format!("/worlds/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+    let admin = format!("{path}/administration");
+    assert_eq!(
+        request(&app, "GET", &admin, Value::Null, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, "GET", &admin, Value::Null, Some(ADMIN))
+            .await
+            .1["revision"],
+        0
+    );
+    for (revision, data) in [(0, listing()), (1, Value::Null)] {
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                &path,
+                json!({"operation_id":Uuid::new_v4(),"expected_revision":revision,"listing":data}),
+                Some(ADMIN)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        request(&app, "GET", &admin, Value::Null, Some(&"b".repeat(64)))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "GET", &admin, Value::Null, Some(ADMIN))
+            .await
+            .1["revision"],
+        2
+    );
+}

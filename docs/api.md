@@ -13,9 +13,30 @@ does not probe the provider or prove that allocations work. `GET /metrics`
 aggregate issuance/revocation counters, with no credential or principal labels.
 `GET /live` checks the
 process. `GET /worlds?q=words&offset=0&limit=30` returns `listings` and optional
-`next_offset`. `GET /worlds/{world_id}/{world_address}` returns one listing or
+`next_offset`. Search includes name, description, game system, language and schedule.
+Optional `system` and `language` filters match exact values case-insensitively;
+`online=true|false` and `full=true|false` filter availability and capacity.
+Entries include `online` and `checked_in_at`. Order is Online accepting, Offline
+accepting, then Full; each group uses recent authenticated check-in, followed by
+stable identity/address ties.
+
+`GET /worlds/{world_id}/{world_address}` returns one listing or
 404. Each entry contains both UUIDv4 identifiers, `revision`, and `listing`.
-Duplicate display names are allowed. Unchecked listings disappear after 30 days.
+Duplicate display names are allowed. Unchecked listings disappear after exactly
+30 days. Anonymous reads do not extend that deadline. Authenticated setup
+startup/renewal checks in the same address, so returning revives its existing
+listing without a metadata mutation. Online is derived from the existing 30-second
+setup lease; stop revokes it, and crashes/unclean shutdowns expire it. Restarting
+the service drops volatile availability while keeping Offline listings.
+
+`GET /worlds/{world_id}/{world_address}/administration` authenticates the same
+administrator Bearer capability and returns `{revision}` including after removal
+or expiry. An address never reserved on this server returns revision 0. Manager
+uses this to move a listing to a configured replacement server (or back again)
+without depending on the old server. The replacement publication remains an
+ordinary revision-checked idempotent mutation. Local deletion/server replacement
+may abandon an old listing, which ages out without further check-in; its requests
+follow normal bounded retention.
 
 `PUT /worlds/{world_id}/{world_address}` requires `Authorization: Bearer` with
 an independently generated 32-byte random token encoded as 64 hexadecimal
@@ -253,3 +274,8 @@ returns `installation_blocked` when that same installation is blocked for the
 World Address. Existing retained requests remain readable. This lets a client
 recover the block without a submission attempt when its write quota is exhausted.
 The ordinary private-read installation/network limits still apply.
+
+Expired prepared requests report Expired and scrub recruitment text at 30 days.
+Their original decision proof remains for the additional 30-day terminal window,
+so an already committed World receipt can finish reconciliation. Unreconciled
+orphans are then deleted; deleted local Worlds need not retain request journals.

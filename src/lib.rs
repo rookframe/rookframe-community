@@ -15,6 +15,18 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
+pub type DirectoryClock = std::sync::Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
+#[derive(Clone)]
+struct DirectoryContext {
+    clock: DirectoryClock,
+    availability: setup::Availability,
+}
+
+pub fn router_with_clock(db: PgPool, clock: DirectoryClock) -> Router {
+    build_router(db, TurnProvider::disabled(), None, clock)
+}
+
 pub fn router(db: PgPool) -> Router {
     router_with_turn(db, TurnProvider::disabled())
 }
@@ -28,6 +40,16 @@ pub fn router_with_turn(db: PgPool, turn: TurnProvider) -> Router {
 }
 
 pub fn router_with_moderation(db: PgPool, turn: TurnProvider, operator: Option<Vec<u8>>) -> Router {
+    build_router(db, turn, operator, std::sync::Arc::new(chrono::Utc::now))
+}
+
+fn build_router(
+    db: PgPool,
+    turn: TurnProvider,
+    operator: Option<Vec<u8>>,
+    clock: DirectoryClock,
+) -> Router {
+    let (setup_router, availability) = setup::router(db.clone(), turn.clone(), clock.clone());
     let health_turn = turn.clone();
     let metrics_turn = turn.clone();
     Router::new()
@@ -64,10 +86,18 @@ pub fn router_with_moderation(db: PgPool, turn: TurnProvider, operator: Option<V
             "/api/v1/worlds/{world}/{address}/capacity",
             axum::routing::put(directory::capacity),
         )
+        .route(
+            "/api/v1/worlds/{world}/{address}/administration",
+            get(directory::administration),
+        )
         .with_state(db.clone())
         .merge(requests::router(db.clone()))
         .merge(moderation::router(db.clone(), operator))
-        .merge(setup::router(db, turn))
+        .merge(setup_router)
+        .layer(axum::Extension(DirectoryContext {
+            clock,
+            availability,
+        }))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(
             tower::ServiceBuilder::new()

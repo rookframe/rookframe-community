@@ -25,6 +25,7 @@ const ATTEMPT_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct SetupService {
+    clock: crate::DirectoryClock,
     db: PgPool,
     book: Arc<Mutex<Book>>,
     turn: TurnProvider,
@@ -102,7 +103,27 @@ struct Locator {
     locator: Uuid,
 }
 
-pub fn router(db: PgPool, turn: TurnProvider) -> Router {
+#[derive(Clone)]
+pub(crate) struct Availability(Arc<Mutex<Book>>);
+
+impl Availability {
+    pub(crate) fn online(&self) -> Vec<String> {
+        let Ok(mut book) = self.0.lock() else {
+            return Vec::new();
+        };
+        book.expire(Instant::now());
+        book.leases
+            .keys()
+            .map(|(world, address)| format!("{world}/{address}"))
+            .collect()
+    }
+}
+
+pub fn router(
+    db: PgPool,
+    turn: TurnProvider,
+    clock: crate::DirectoryClock,
+) -> (Router, Availability) {
     let book = Arc::new(Mutex::new(Book {
         leases: HashMap::new(),
         grants: HashMap::new(),
@@ -124,7 +145,8 @@ pub fn router(db: PgPool, turn: TurnProvider) -> Router {
             }
         }
     });
-    Router::new()
+    let availability = Availability(book.clone());
+    let router = Router::new()
         .route(
             "/api/v1/setup/worlds/{world}/{address}",
             get(resolve).put(publish).delete(revoke),
@@ -149,7 +171,13 @@ pub fn router(db: PgPool, turn: TurnProvider) -> Router {
             "/api/v1/setup/worlds/{world}/{address}/connections/{attempt}/relay",
             axum::routing::delete(revoke_relay),
         )
-        .with_state(SetupService { db, book, turn })
+        .with_state(SetupService {
+            db,
+            book,
+            turn,
+            clock,
+        });
+    (router, availability)
 }
 
 fn missing() -> ApiError {
@@ -307,6 +335,14 @@ async fn publish(
     if current.get::<Vec<u8>, _>("administrator_digest") != digest {
         return Err(ApiError(StatusCode::FORBIDDEN, "administrator_mismatch"));
     }
+    sqlx::query(
+        "UPDATE world_addresses SET checked_in_at=$3 WHERE world_id=$1 AND world_address=$2",
+    )
+    .bind(key.0)
+    .bind(key.1)
+    .bind((service.clock)())
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     let mut book = service.lock()?;
     if !book.leases.contains_key(&key) && book.leases.len() >= 512 {

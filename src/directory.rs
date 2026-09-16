@@ -1,6 +1,6 @@
 use crate::error::ApiError;
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
@@ -39,6 +39,10 @@ pub struct Search {
     #[serde(default)]
     offset: i64,
     limit: Option<i64>,
+    system: Option<String>,
+    language: Option<String>,
+    online: Option<bool>,
+    full: Option<bool>,
 }
 
 fn valid_id(id: Uuid) -> bool {
@@ -47,6 +51,7 @@ fn valid_id(id: Uuid) -> bool {
 
 pub async fn publish(
     State(db): State<PgPool>,
+    Extension(context): Extension<crate::DirectoryContext>,
     Path((world, address)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(change): Json<Mutation>,
@@ -108,8 +113,8 @@ pub async fn publish(
         .as_ref()
         .map(|l| serde_json::to_value(l).expect("serializable listing"));
     let result = json!({"operation_id":change.operation_id,"revision":revision+1,"visibility":if listing.is_some(){"public"}else{"private"}});
-    sqlx::query("UPDATE world_addresses SET listing=$3,revision=revision+1,checked_in_at=now(),admission_revision=$4,reserved_seats=$5,claimed_seats=$6 WHERE world_id=$1 AND world_address=$2")
-        .bind(world).bind(address).bind(listing).bind(capacity.revision).bind(capacity.reserved).bind(capacity.claimed).execute(&mut *tx).await?;
+    sqlx::query("UPDATE world_addresses SET listing=$3,revision=revision+1,checked_in_at=$7,admission_revision=$4,reserved_seats=$5,claimed_seats=$6 WHERE world_id=$1 AND world_address=$2")
+        .bind(world).bind(address).bind(listing).bind(capacity.revision).bind(capacity.reserved).bind(capacity.claimed).bind((context.clock)()).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO directory_operations (world_id,world_address,operation_id,request,result) VALUES ($1,$2,$3,$4,$5)")
         .bind(world).bind(address).bind(change.operation_id).bind(payload).bind(&result).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -169,20 +174,30 @@ impl Listing {
 
 pub async fn read(
     State(db): State<PgPool>,
+    Extension(context): Extension<crate::DirectoryContext>,
     Path((world, address)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
-    let row = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND NOT moderated AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days'")
-        .bind(world).bind(address).fetch_optional(&db).await?.ok_or(ApiError(StatusCode::NOT_FOUND,"listing_not_found"))?;
+    let row = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats,checked_in_at,concat(world_id,'/',world_address) = ANY($4) AS online FROM world_addresses WHERE world_id=$1 AND world_address=$2 AND NOT moderated AND listing IS NOT NULL AND checked_in_at > $3-interval '30 days'")
+        .bind(world).bind(address).bind((context.clock)()).bind(context.availability.online()).fetch_optional(&db).await?.ok_or(ApiError(StatusCode::NOT_FOUND,"listing_not_found"))?;
     Ok(Json(entry(row)))
 }
 pub async fn browse(
     State(db): State<PgPool>,
+    Extension(context): Extension<crate::DirectoryContext>,
     Query(search): Query<Search>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = search.limit.unwrap_or(30);
     if !(1..=50).contains(&limit)
         || !(0..=100000).contains(&search.offset)
         || search.q.encode_utf16().count() > 200
+        || search
+            .system
+            .as_ref()
+            .is_some_and(|s| s.encode_utf16().count() > 200)
+        || search
+            .language
+            .as_ref()
+            .is_some_and(|s| s.encode_utf16().count() > 100)
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_search"));
     }
@@ -194,8 +209,10 @@ pub async fn browse(
             .replace('%', "\\%")
             .replace('_', "\\_")
     );
-    let rows = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats FROM world_addresses WHERE NOT moderated AND listing IS NOT NULL AND checked_in_at > now()-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language') ILIKE $1 ORDER BY (reserved_seats >= (listing->>'player_limit')::int),checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
-        .bind(pattern).bind(limit+1).bind(search.offset).fetch_all(&db).await?;
+    let rows = sqlx::query("SELECT world_id,world_address,revision,listing,reserved_seats,claimed_seats,checked_in_at,concat(world_id,'/',world_address) = ANY($4) AS online FROM world_addresses WHERE NOT moderated AND listing IS NOT NULL AND checked_in_at > $5-interval '30 days' AND concat_ws(' ',listing->>'name',listing->>'description',listing->>'game_system',listing->>'language',listing->>'schedule') ILIKE $1 AND ($6::text IS NULL OR lower(listing->>'game_system')=lower($6)) AND ($7::text IS NULL OR lower(listing->>'language')=lower($7)) AND ($8::boolean IS NULL OR (concat(world_id,'/',world_address) = ANY($4))=$8) AND ($9::boolean IS NULL OR (reserved_seats >= (listing->>'player_limit')::int)=$9) ORDER BY CASE WHEN reserved_seats >= (listing->>'player_limit')::int THEN 2 WHEN concat(world_id,'/',world_address) = ANY($4) THEN 0 ELSE 1 END,checked_in_at DESC,world_id,world_address LIMIT $2 OFFSET $3")
+        .bind(pattern).bind(limit+1).bind(search.offset).bind(context.availability.online())
+        .bind((context.clock)()).bind(search.system).bind(search.language).bind(search.online).bind(search.full)
+        .fetch_all(&db).await?;
     let next = if rows.len() > limit as usize {
         Some(search.offset + limit)
     } else {
@@ -207,7 +224,7 @@ pub async fn browse(
 }
 fn entry(row: sqlx::postgres::PgRow) -> Value {
     let listing: Value = row.get("listing");
-    json!({"full": row.get::<i32,_>("reserved_seats") >= listing["player_limit"].as_i64().unwrap_or(0) as i32, "reserved_seats":row.get::<i32,_>("reserved_seats"), "claimed_seats":row.get::<i32,_>("claimed_seats"), "world_id":row.get::<Uuid,_>("world_id"),"world_address":row.get::<Uuid,_>("world_address"),"revision":row.get::<i64,_>("revision"),"listing":row.get::<Value,_>("listing")})
+    json!({"online": row.get::<bool,_>("online"), "checked_in_at": row.get::<chrono::DateTime<chrono::Utc>,_>("checked_in_at"), "full": row.get::<i32,_>("reserved_seats") >= listing["player_limit"].as_i64().unwrap_or(0) as i32, "reserved_seats":row.get::<i32,_>("reserved_seats"), "claimed_seats":row.get::<i32,_>("claimed_seats"), "world_id":row.get::<Uuid,_>("world_id"),"world_address":row.get::<Uuid,_>("world_address"),"revision":row.get::<i64,_>("revision"),"listing":row.get::<Value,_>("listing")})
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -292,4 +309,24 @@ pub async fn capacity(
         .bind(change.capacity.claimed).bind(change.remove_listing || fully_claimed).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"revision":change.capacity.revision})))
+}
+
+// A new Community Server can confirm its own revision without contacting the old
+// service. Removed/expired listings still retain their ownership reservation.
+pub async fn administration(
+    State(db): State<PgPool>,
+    Path((world, address)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let digest = crate::requests::identity(&headers)?;
+    let row = sqlx::query("SELECT administrator_digest,revision FROM world_addresses WHERE world_id=$1 AND world_address=$2")
+        .bind(world).bind(address).fetch_optional(&db).await?;
+    if let Some(row) = row {
+        if row.get::<Vec<u8>, _>("administrator_digest") != digest {
+            return Err(ApiError(StatusCode::FORBIDDEN, "administrator_mismatch"));
+        }
+        Ok(Json(json!({"revision":row.get::<i64,_>("revision")})))
+    } else {
+        Ok(Json(json!({"revision":0})))
+    }
 }

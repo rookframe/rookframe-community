@@ -94,10 +94,10 @@ pub(crate) fn administrator(row: &PgRow, digest: &[u8]) -> Result<(), ApiError> 
     Ok(())
 }
 
-// A decision already handed to World Authority is reconciled by Manager. Scrub
-// its recruitment text at the deadline even when its durable outcome is in doubt.
+// Expired decisions retain their operation proof for the terminal retention
+// window, allowing an already durable World receipt to finish reconciliation.
 pub async fn cleanup(db: &PgPool) -> Result<(), ApiError> {
-    sqlx::query("UPDATE join_requests SET status='expired',terminal_at=expires_at WHERE status='pending' AND decision_id IS NULL AND expires_at<=now()")
+    sqlx::query("UPDATE join_requests SET status='expired',terminal_at=expires_at WHERE status='pending' AND expires_at<=now()")
         .execute(db).await?;
     sqlx::query("UPDATE join_requests SET name=NULL,message=NULL WHERE expires_at<=now() AND (name IS NOT NULL OR message IS NOT NULL)")
         .execute(db).await?;
@@ -271,8 +271,16 @@ pub async fn read(
     let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM installation_blocks WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3)")
         .bind(world).bind(address).bind(digest).fetch_one(&db).await?;
     Err(ApiError(
-        if blocked { StatusCode::FORBIDDEN } else { StatusCode::NOT_FOUND },
-        if blocked { "installation_blocked" } else { "request_not_found" },
+        if blocked {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::NOT_FOUND
+        },
+        if blocked {
+            "installation_blocked"
+        } else {
+            "request_not_found"
+        },
     ))
 }
 
@@ -392,7 +400,9 @@ pub async fn decide(
         .receipt
         .as_ref()
         .map(|r| serde_json::to_value(r).expect("receipt"));
-    if status != "pending" {
+    if status != "pending"
+        && !(status == "expired" && previous == Some(body.decision_id) && body.action == "accept")
+    {
         if previous == Some(body.decision_id)
             && ((status == "accepted"
                 && body.action == "accept"
