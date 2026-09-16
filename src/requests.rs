@@ -396,6 +396,20 @@ pub async fn decide(
     {
         return Err(ApiError(StatusCode::CONFLICT, "request_terminal"));
     }
+    if status == "expired"
+        && body.action == "abort"
+        && (previous.is_none() || previous == Some(body.decision_id))
+    {
+        // An expired abort cannot create a Seat. Clear its proof without renewing
+        // retention; repeating the acknowledgement is safe after a lost reply.
+        sqlx::query("UPDATE join_requests SET decision_id=NULL WHERE request_id=$1")
+            .bind(target.2)
+            .execute(&mut *tx)
+            .await?;
+        let result = locked_request(&mut tx, target).await?;
+        tx.commit().await?;
+        return Ok(Json(view(&result, true)));
+    }
     let receipt = body
         .receipt
         .as_ref()
@@ -441,6 +455,18 @@ pub async fn decide(
                 })
             {
                 return Err(ApiError(StatusCode::CONFLICT, "decision_mismatch"));
+            }
+            if status == "expired" {
+                let installation: Vec<u8> = row.get("installation_digest");
+                let accepted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM join_requests WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3 AND status='accepted' AND NOT removed)")
+                    .bind(target.0).bind(target.1).bind(&installation).fetch_one(&mut *tx).await?;
+                if accepted {
+                    return Err(ApiError(StatusCode::CONFLICT, "decision_conflict"));
+                }
+                // A replacement application can be submitted after expiry. The
+                // original durable World receipt wins without authoring a Seat.
+                sqlx::query("UPDATE join_requests SET status='expired',terminal_at=now(),decision_id=NULL,name=NULL,message=NULL WHERE world_id=$1 AND world_address=$2 AND installation_digest=$3 AND status='pending'")
+                    .bind(target.0).bind(target.1).bind(installation).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE join_requests SET status='accepted',terminal_at=now(),receipt=$2,message=NULL WHERE request_id=$1")
                 .bind(target.2).bind(receipt).execute(&mut *tx).await?;

@@ -457,6 +457,19 @@ async fn interrupted_decision_scrubs_recruitment_text_at_thirty_days_and_recover
     let (_, result) = request(&app, "GET", &path, Value::Null, APPLICANT).await;
     assert!(result["name"].is_null() && result["message"].is_null());
     assert_eq!(result["status"], "expired");
+    let replacement = format!("{world}/requests/{}", Uuid::new_v4());
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &replacement,
+            json!({"name":"Mira", "message":"Trying again"}),
+            APPLICANT
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     let receipt = json!({"seat_id":id,"name":"Mira","credential":OTHER});
     assert_eq!(
         request(
@@ -473,6 +486,80 @@ async fn interrupted_decision_scrubs_recruitment_text_at_thirty_days_and_recover
     assert_eq!(
         request(&app, "GET", &path, Value::Null, APPLICANT).await.1["receipt"],
         receipt
+    );
+    assert_eq!(
+        request(&app, "GET", &replacement, Value::Null, APPLICANT)
+            .await
+            .1["status"],
+        "expired"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &format!("{path}/decision"),
+            json!({"decision_id":operation,"action":"accept","receipt":receipt}),
+            ADMIN
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn expired_preparation_aborts_idempotently_without_extending_retention(db: PgPool) {
+    let app = rookframe_community::router(db.clone());
+    let world = published(&app).await;
+    let id = Uuid::new_v4();
+    let path = format!("{world}/requests/{id}");
+    request(
+        &app,
+        "PUT",
+        &path,
+        json!({"name":"Mira","message":"Private"}),
+        APPLICANT,
+    )
+    .await;
+    let operation = Uuid::new_v4();
+    let decision = format!("{path}/decision");
+    request(
+        &app,
+        "PUT",
+        &decision,
+        json!({"decision_id":operation,"action":"prepare"}),
+        ADMIN,
+    )
+    .await;
+    sqlx::query("UPDATE join_requests SET expires_at=now()-interval '1 day' WHERE request_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let result = request(
+            &app,
+            "PUT",
+            &decision,
+            json!({"decision_id":operation,"action":"abort"}),
+            ADMIN,
+        )
+        .await;
+        assert_eq!(result.0, StatusCode::OK);
+        assert_eq!(result.1["status"], "expired");
+        assert!(sqlx::query_scalar::<_, bool>("SELECT decision_id IS NULL AND terminal_at=expires_at FROM join_requests WHERE request_id=$1").bind(id).fetch_one(&db).await.unwrap());
+    }
+    assert_eq!(request(&app, "PUT", &decision, json!({"decision_id":operation,"action":"accept","receipt":{"seat_id":id,"name":"Mira","credential":OTHER}}), ADMIN).await.0, StatusCode::CONFLICT);
+    sqlx::query(
+        "UPDATE join_requests SET terminal_at=now()-interval '31 days' WHERE request_id=$1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&app, "GET", &path, Value::Null, APPLICANT).await.0,
+        StatusCode::NOT_FOUND
     );
 }
 

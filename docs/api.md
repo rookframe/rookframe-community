@@ -212,10 +212,13 @@ completed decision return the same outcome. Applicants alone receive credentials
 GM review receives an installation hash, never the applicant's bearer proof.
 
 Undecided requests expire after 30 days. Recruitment name/message text is scrubbed
-at that deadline, including interrupted decisions. A prepared decision awaiting
-its World outcome retains only reconciliation metadata until Manager resolves it;
-expiring it blindly could contradict an already committed Seat. Terminal status,
-response, and accepted receipt are removed 30 days after the terminal outcome.
+at that deadline, including interrupted decisions. Expired preparations retain
+only reconciliation proof for the 30-day terminal retention window. A matching
+abort clears that proof without extending retention. Within that window an
+already durable World receipt can still reconcile; a newer pending application
+from the same installation expires atomically when the original receipt arrives.
+An existing accepted identity is never overwritten. Terminal status, response,
+and accepted receipt are removed 30 days after the terminal outcome.
 Maintenance runs every minute and before request reads/mutations. All request
 responses use `Cache-Control: no-store`; request bodies are not logged or public.
 
